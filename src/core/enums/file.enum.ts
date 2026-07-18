@@ -1,0 +1,40 @@
+export enum FileType {
+    FOLDER = "folder",
+    VIDEO = "video",
+    IMAGE = "image",
+    OTHER = "other",
+}
+
+export enum FileStatus {
+    WAITING = "waiting",
+    PROCESSING = "processing",
+    READY = "ready",
+    READY_ORIGINAL = "ready_original",
+    ERROR = "error",
+    QUEUE = "queue",
+}
+
+export enum MediaType {
+    VIDEO = "video",
+    AUDIO = "audio",
+    SUBTITLE = "subtitle",
+    THUMBNAIL = "thumbnail",
+    IMAGE = "image",
+    DOCUMENT = "document",
+    OTHER = "other",
+}
+
+export enum IngestSourceType {
+    UPLOAD = "upload",
+    REMOTE = "remote",
+    GDRIVE = "gdrive",
+    S3_IMPORT = "s3_import",
+    // สร้างโดย worker (download/HLS) = ไฟล์ผลลัพธ์บน S3 temp รอ transfer ลง storage
+    PROCESSED = "processed",
+}
+
+export enum IngestStatus {
+    UPLOADING = "uploading",
+    COMPLETED = "completed",
+    FAILED = "failed",
+}
