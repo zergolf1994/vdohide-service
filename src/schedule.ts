@@ -2,7 +2,14 @@ import schedule from "node-schedule"
 import mongoose from "mongoose"
 import { getDownloadOriginal } from "@/services/cron-job/get-download-original.service"
 import { getTransferPending } from "@/services/cron-job/get-transfer-pending.service"
+import { getSpritesheetPending } from "@/services/cron-job/get-spritesheet-pending.service"
+import { getTranscodePending } from "@/services/cron-job/get-transcode-pending.service"
 import { releaseStaleJobs } from "@/services/cron-job/release-stale-jobs.service"
+import { cleanupDeletedIngests } from "@/services/cron-job/cleanup-deleted-ingests.service"
+import { cleanupDeletedFiles } from "@/services/cron-job/cleanup-deleted-files.service"
+import { archiveCompletedProcesses } from "@/services/cron-job/archive-completed-processes.service"
+import { updateWorkspaceUsage } from "@/services/cron-job/update-workspace-usage.service"
+import { cleanupOriginalMedia } from "@/services/cron-job/cleanup-original-media.service"
 
 // enqueuer หนึ่งตัวต่อหนึ่ง cron — กันรอบใหม่ทับรอบเก่า + log เฉพาะตอนสถานะเปลี่ยน
 const runEnqueuer = (name: string, fn: () => Promise<{ message?: string; data?: any } | undefined>) => {
@@ -36,6 +43,24 @@ const runEnqueuer = (name: string, fn: () => Promise<{ message?: string; data?: 
 // เหลื่อมวินาทีกัน — ไม่ยิง DB พร้อมกันเป๊ะทุกรอบ
 schedule.scheduleJob("*/20 * * * * *", runEnqueuer("enqueuer:download", getDownloadOriginal));
 schedule.scheduleJob("10,30,50 * * * * *", runEnqueuer("enqueuer:transfer", getTransferPending));
+schedule.scheduleJob("15,45 * * * * *", runEnqueuer("enqueuer:spritesheet", getSpritesheetPending));
+schedule.scheduleJob("25,55 * * * * *", runEnqueuer("enqueuer:transcode", getTranscodePending));
 
 // reaper: worker ตายคางาน (heartbeat ขาดเกิน 3 นาที) → คืนงานเข้าคิว
 schedule.scheduleJob("5 * * * * *", runEnqueuer("reaper", releaseStaleJobs));
+
+// cleanup ทุก 5 นาที (เหลื่อมวินาทีกัน): ลบ object บน S3 ของ ingest ที่
+// soft-delete แล้ว → ลบ doc | file ที่ลบแล้วไม่เหลือ ingest/media → ลบ doc
+schedule.scheduleJob("35 */5 * * * *", runEnqueuer("cleanup:ingests", cleanupDeletedIngests));
+schedule.scheduleJob("55 */5 * * * *", runEnqueuer("cleanup:files", cleanupDeletedFiles));
+
+// archive: completed ค้างเกิน 5 นาที → ย้ายไป video_process_history (TTL 30 วัน)
+// คิวหลักเหลือแต่งาน active + failed/cancelled
+schedule.scheduleJob("15 */5 * * * *", runEnqueuer("archive:processes", archiveCompletedProcesses));
+
+// usage: รวม files.size ราย workspace → workspaces.capacity.used
+schedule.scheduleJob("45 */5 * * * *", runEnqueuer("update:workspace-usage", updateWorkspaceUsage));
+
+// originals: rendition = highest ติดตั้งแล้ว → soft-delete media original
+// (storage-node เป็นคนลบไฟล์จริงตาม refcount)
+schedule.scheduleJob("40 */5 * * * *", runEnqueuer("cleanup:originals", cleanupOriginalMedia));

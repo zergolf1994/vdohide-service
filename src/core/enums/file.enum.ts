@@ -38,3 +38,11 @@ export enum IngestStatus {
     COMPLETED = "completed",
     FAILED = "failed",
 }
+// resolution ของ video media — ต้อง match กับ Go workers (media.enum.go)
+export enum Resolution {
+    ORIGINAL = "original",
+    R1080 = "1080",
+    R720 = "720",
+    R480 = "480",
+    R360 = "360",
+}
