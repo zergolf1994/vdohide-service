@@ -4,6 +4,7 @@ import { getDownloadOriginal } from "@/services/cron-job/get-download-original.s
 import { getTransferPending } from "@/services/cron-job/get-transfer-pending.service"
 import { getSpritesheetPending } from "@/services/cron-job/get-spritesheet-pending.service"
 import { getTranscodePending } from "@/services/cron-job/get-transcode-pending.service"
+import { getPrewarmPending } from "@/services/cron-job/get-prewarm-pending.service"
 import { releaseStaleJobs } from "@/services/cron-job/release-stale-jobs.service"
 import { cleanupDeletedIngests } from "@/services/cron-job/cleanup-deleted-ingests.service"
 import { cleanupDeletedFiles } from "@/services/cron-job/cleanup-deleted-files.service"
@@ -45,6 +46,9 @@ schedule.scheduleJob("*/20 * * * * *", runEnqueuer("enqueuer:download", getDownl
 schedule.scheduleJob("10,30,50 * * * * *", runEnqueuer("enqueuer:transfer", getTransferPending));
 schedule.scheduleJob("15,45 * * * * *", runEnqueuer("enqueuer:spritesheet", getSpritesheetPending));
 schedule.scheduleJob("25,55 * * * * *", runEnqueuer("enqueuer:transcode", getTranscodePending));
+// prewarm งานไม่รีบเท่าตัวอื่น (ผู้ชมเล่นได้อยู่แล้ว แค่ช้ากว่าตอน MISS)
+// — ทุก 1 นาทีพอ
+schedule.scheduleJob("50 * * * * *", runEnqueuer("enqueuer:prewarm", getPrewarmPending));
 
 // reaper: worker ตายคางาน (heartbeat ขาดเกิน 3 นาที) → คืนงานเข้าคิว
 schedule.scheduleJob("5 * * * * *", runEnqueuer("reaper", releaseStaleJobs));

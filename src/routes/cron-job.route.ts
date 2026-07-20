@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { getDownloadOriginal } from '@/services/cron-job/get-download-original.service';
 import { getTransferPending } from '@/services/cron-job/get-transfer-pending.service';
 import { getSpritesheetPending } from '@/services/cron-job/get-spritesheet-pending.service';
+import { getPrewarmPending } from '@/services/cron-job/get-prewarm-pending.service';
 import { getTranscodePending } from '@/services/cron-job/get-transcode-pending.service';
 import { releaseStaleJobs } from '@/services/cron-job/release-stale-jobs.service';
 import { cleanupDeletedIngests } from '@/services/cron-job/cleanup-deleted-ingests.service';
@@ -42,6 +43,15 @@ router.get('/transcode-pending', async (req: Request, res: Response) => {
 router.get('/spritesheet-pending', async (req: Request, res: Response) => {
     try {
         const result = await getSpritesheetPending();
+        return res.status(200).json(result);
+    } catch (error) {
+        return res.status(500).json({ error });
+    }
+});
+
+router.get('/prewarm-pending', async (req: Request, res: Response) => {
+    try {
+        const result = await getPrewarmPending();
         return res.status(200).json(result);
     } catch (error) {
         return res.status(500).json({ error });
