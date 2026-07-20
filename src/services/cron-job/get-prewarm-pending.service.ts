@@ -63,9 +63,9 @@ const ensureReprewarmIndex = async (pop: string) => {
     try {
         await MediaModel.collection.createIndex({ [`prewarm.${pop}.prewarmAt`]: 1 });
     } catch (error: any) {
-        // 85 = IndexOptionsConflict — เวอร์ชันก่อนเคยสร้างแบบ sparse ไว้
-        // ลบทิ้งแล้วสร้างใหม่ให้ครอบ missing-field ด้วย
-        if (error?.code === 85) {
+        // 85 IndexOptionsConflict / 86 IndexKeySpecsConflict — เวอร์ชันก่อน
+        // เคยสร้างแบบ sparse ไว้ ลบทิ้งแล้วสร้างใหม่ให้ครอบ missing-field ด้วย
+        if (error?.code === 85 || error?.code === 86) {
             try {
                 await MediaModel.collection.dropIndex(`prewarm.${pop}.prewarmAt_1`);
                 await MediaModel.collection.createIndex({ [`prewarm.${pop}.prewarmAt`]: 1 });
@@ -130,23 +130,35 @@ export const getPrewarmPending = async () => {
 
         for (const [pop, ws] of popWorkers) {
             // คิวแยกโควตาตามชนิดงาน — เหมือน bi-level scheduler ของระบบเก่า
-            //   new: prewarm_max_concurrent คงที่ต่อ pop (งานไฟล์ใหม่ของเครื่องหลัก)
             //   reprewarm: prewarm_old_max_concurrent "ต่อเครื่อง" — 10 เครื่อง
             //   × 5 = 50 งานค้างได้พร้อมกัน
+            //   media ที่ยังไม่เคย warm (firstWarm): จำกัด prewarm_max_concurrent
+            //   "ต่อ storage" — warm ครั้งแรก CF ต้อง MISS ไปดูดจาก origin จริง
+            //   ถ้าปล่อยพร้อมกันเยอะจะกินแบนด์วิดท์ (1Gbps) ของ storage นั้น
             const [openNew, openOld] = await Promise.all([
                 PrewarmQueueModel.countDocuments({ pop, kind: "new" }),
                 PrewarmQueueModel.countDocuments({ pop, kind: "reprewarm" }),
             ]);
-            const slotsNew = cfg.enabled
-                ? cfg.prewarm_max_concurrent * QUEUE_BUFFER - openNew
-                : 0;
             const slotsOld = cfg.enabled_old
                 ? cfg.prewarm_old_max_concurrent * ws.length * QUEUE_BUFFER - openOld
                 : 0;
-            if (slotsNew <= 0 && slotsOld <= 0) {
-                summary[pop] = { openNew, openOld, message: "Queue is full" };
-                continue;
-            }
+
+            // โควตา firstWarm ที่ใช้ไปแล้วต่อ storage (นับงานค้างทุกชนิด)
+            const capPerStorage = cfg.prewarm_max_concurrent;
+            const usedAgg = await PrewarmQueueModel.aggregate([
+                { $match: { pop, firstWarm: true } },
+                { $group: { _id: "$storageId", n: { $sum: 1 } } },
+            ]);
+            const usedPerStorage = new Map<string, number>(
+                (usedAgg as any[]).map((x) => [String(x._id ?? ""), x.n])
+            );
+            const takeStorageSlot = (storageId: any) => {
+                const sid = String(storageId ?? "");
+                const used = usedPerStorage.get(sid) ?? 0;
+                if (used >= capPerStorage) return false;
+                usedPerStorage.set(sid, used + 1);
+                return true;
+            };
 
             // storage ที่มี worker ผูกอยู่ใน pop นี้ — งาน new ของ storage
             // พวกนี้ถูกประทับ target ให้ worker ตัวนั้นเท่านั้น
@@ -164,7 +176,8 @@ export const getPrewarmPending = async () => {
 
             // ── new: ยังไม่เคย warm บน pop นี้ (ใหม่ก่อน — เหมือนระบบเก่า) ──
             // pop อื่นนอกจาก fra ต้องรอ fra เสร็จก่อนถึงจะเข้าคิวได้
-            if (slotsNew > 0) {
+            // จำกัดคิวค้างไม่เกิน capPerStorage ต่อ storage (คุมแบนด์วิดท์ origin)
+            if (cfg.enabled) {
                 const newMedias = await MediaModel.find({
                     ...targetMediaFilter,
                     [`prewarm.${pop}`]: { $exists: false },
@@ -175,19 +188,17 @@ export const getPrewarmPending = async () => {
                     ...(excludeIds.size > 0 ? { _id: { $nin: [...excludeIds] } } : {}),
                 })
                     .sort({ createdAt: -1 })
-                    .limit(slotsNew * 3) // เผื่อโดน file gate ตัดทิ้ง
+                    .limit(Math.max(60, capPerStorage * 20)) // เผื่อโดน cap/file gate ตัดทิ้ง
                     .select({ _id: 1, fileId: 1, slug: 1, type: 1, resolution: 1, storageId: 1 })
                     .lean();
 
                 const newFileSlugs = await getPlayableFiles(
                     [...new Set((newMedias as any[]).map((m) => String(m.fileId)).filter(Boolean))]
                 );
-                let pickedNew = 0;
                 for (const m of newMedias as any[]) {
-                    if (pickedNew >= slotsNew) break;
                     const fileSlug = newFileSlugs.get(String(m.fileId));
                     if (!fileSlug) continue;
-                    pickedNew++;
+                    if (!takeStorageSlot(m.storageId)) continue; // storage นี้เต็มโควตา — รอบหน้า
                     excludeIds.add(String(m._id));
                     enqueueDocs.push({
                         mediaId: m._id,
@@ -196,6 +207,8 @@ export const getPrewarmPending = async () => {
                         mediaSlug: m.slug,
                         type: m.type,
                         resolution: m.resolution,
+                        storageId: m.storageId,
+                        firstWarm: true,
                         pop,
                         kind: "new",
                         status: "pending",
@@ -233,7 +246,10 @@ export const getPrewarmPending = async () => {
                 })
                     .sort({ [`prewarm.${pop}.prewarmAt`]: 1 })
                     .limit(slotsOld * 3)
-                    .select({ _id: 1, fileId: 1, slug: 1, type: 1, resolution: 1 })
+                    .select({
+                        _id: 1, fileId: 1, slug: 1, type: 1, resolution: 1,
+                        storageId: 1, [`prewarm.${pop}.prewarmAt`]: 1,
+                    })
                     .lean();
 
                 const oldFileSlugs = await getPlayableFiles(
@@ -244,6 +260,10 @@ export const getPrewarmPending = async () => {
                     if (pickedOld >= slotsOld) break;
                     const fileSlug = oldFileSlugs.get(String(m.fileId));
                     if (!fileSlug) continue;
+                    // backlog (ยังไม่เคย warm) กินแบนด์วิดท์ origin เท่างาน new
+                    // — ใช้โควตาต่อ storage ร่วมกัน; re-warm ตามอายุไม่จำกัด
+                    const firstWarm = !m.prewarm?.[pop]?.prewarmAt;
+                    if (firstWarm && !takeStorageSlot(m.storageId)) continue;
                     pickedOld++;
                     enqueueDocs.push({
                         mediaId: m._id,
@@ -252,6 +272,8 @@ export const getPrewarmPending = async () => {
                         mediaSlug: m.slug,
                         type: m.type,
                         resolution: m.resolution,
+                        storageId: m.storageId,
+                        ...(firstWarm ? { firstWarm: true } : {}),
                         pop,
                         kind: "reprewarm",
                         status: "pending",
@@ -276,8 +298,8 @@ export const getPrewarmPending = async () => {
             summary[pop] = {
                 openNew,
                 openOld,
-                slotsNew: Math.max(0, slotsNew),
                 slotsOld: Math.max(0, slotsOld),
+                firstWarmPerStorage: Object.fromEntries(usedPerStorage),
                 candidates: enqueueDocs.length,
                 enqueued,
             };

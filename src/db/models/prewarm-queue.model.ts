@@ -19,6 +19,11 @@ const prewarmQueueSchema = new Schema(
 
         type: { type: String }, // video | thumbnail
         resolution: { type: String },
+        // storage ของ media (ข้อมูลประกอบ + ใช้คุมโควตา firstWarm ต่อ storage)
+        storageId: { type: String, ref: "Storage" },
+        // true = media ยังไม่เคย warm บน pop นี้ — warm ครั้งแรก CF MISS ดูด
+        // จาก origin จริง enqueuer จำกัดงานค้างต่อ storage ด้วย field นี้
+        firstWarm: { type: Boolean },
         pop: { type: String, required: true }, // edge ที่งานนี้จะ warm (เช่น fra, sin)
         kind: { type: String, default: "new" }, // new | reprewarm
 
