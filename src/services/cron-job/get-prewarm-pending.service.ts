@@ -39,6 +39,10 @@ const default_prewarm_setting: PrewarmSetting = {
 const PREWARM_RESOLUTIONS = ["original", "1080", "720", "480", "360"];
 const STALE_CLAIM_MS = 10 * 60 * 1000; // worker ตายคางาน → คืนคิว
 
+// เผื่อคิวล่วงหน้า 3 เท่าของจำนวนที่ worker รันพร้อมกัน — งานจบเป็นวินาที
+// แต่ cron เติมทุก 1 นาที ถ้าคิว = จำนวน slot พอดี worker จะว่างรอรอบเติม
+const QUEUE_BUFFER = 3;
+
 // media ที่ warm ได้: วิดีโอทุก rendition
 // (sprite ถอดออกชั่วคราว — จะกลับมาเปิดทีหลัง แค่คืนบรรทัด THUMBNAIL;
 //  worker รองรับ type thumbnail อยู่แล้ว ไม่ต้องแก้ฝั่งนั้น)
@@ -123,9 +127,11 @@ export const getPrewarmPending = async () => {
                 PrewarmQueueModel.countDocuments({ pop, kind: "new" }),
                 PrewarmQueueModel.countDocuments({ pop, kind: "reprewarm" }),
             ]);
-            const slotsNew = cfg.enabled ? cfg.prewarm_max_concurrent - openNew : 0;
+            const slotsNew = cfg.enabled
+                ? cfg.prewarm_max_concurrent * QUEUE_BUFFER - openNew
+                : 0;
             const slotsOld = cfg.enabled_old
-                ? cfg.prewarm_old_max_concurrent * ws.length - openOld
+                ? cfg.prewarm_old_max_concurrent * ws.length * QUEUE_BUFFER - openOld
                 : 0;
             if (slotsNew <= 0 && slotsOld <= 0) {
                 summary[pop] = { openNew, openOld, message: "Queue is full" };
