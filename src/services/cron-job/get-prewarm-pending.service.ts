@@ -54,17 +54,27 @@ const targetMediaFilter = {
     ],
 };
 
-// reprewarm ต้อง sort ด้วย prewarm.{pop}.prewarmAt — สร้าง index ครั้งแรกที่เจอ pop
+// ช่องเก่า sort ด้วย prewarm.{pop}.prewarmAt (media ที่ไม่มี field = null มา
+// ก่อน) — ต้องเป็น index แบบไม่ sparse ถึงครอบ doc ที่ยังไม่เคย warm ด้วย
 const ensuredPopIndexes = new Set<string>();
 const ensureReprewarmIndex = async (pop: string) => {
     if (ensuredPopIndexes.has(pop)) return;
     ensuredPopIndexes.add(pop);
     try {
-        await MediaModel.collection.createIndex(
-            { [`prewarm.${pop}.prewarmAt`]: 1 },
-            { sparse: true, background: true }
-        );
-    } catch (error) {
+        await MediaModel.collection.createIndex({ [`prewarm.${pop}.prewarmAt`]: 1 });
+    } catch (error: any) {
+        // 85 = IndexOptionsConflict — เวอร์ชันก่อนเคยสร้างแบบ sparse ไว้
+        // ลบทิ้งแล้วสร้างใหม่ให้ครอบ missing-field ด้วย
+        if (error?.code === 85) {
+            try {
+                await MediaModel.collection.dropIndex(`prewarm.${pop}.prewarmAt_1`);
+                await MediaModel.collection.createIndex({ [`prewarm.${pop}.prewarmAt`]: 1 });
+                return;
+            } catch (e) {
+                console.error(`ensureReprewarmIndex(${pop}) recreate -> Error:`, e);
+                return;
+            }
+        }
         console.error(`ensureReprewarmIndex(${pop}) -> Error:`, error);
     }
 };
@@ -196,16 +206,32 @@ export const getPrewarmPending = async () => {
                 }
             }
 
-            // ── reprewarm: เคย warm แล้ว เก่ากว่า cutoff — worker ไหนก็ได้ ──
+            // ── ช่องเก่า: กวาดคลังคู่ขนานกับช่อง new — ทั้งตัวที่ยังไม่เคย
+            // warm บน pop นี้ (backlog) และตัวที่ warm แล้วแก่เกิน cutoff
+            // sort ด้วย prewarmAt (ไม่มี field = null มาก่อน) → backlog ไหล
+            // ผ่านช่องนี้จนหมด แล้วช่องนี้กลายเป็น re-warm ตามอายุล้วนๆ
             if (slotsOld > 0 && cfg.reprewarm_age_minutes > 0) {
                 await ensureReprewarmIndex(pop);
                 const cutoff = new Date(Date.now() - cfg.reprewarm_age_minutes * 60_000);
+                const { $or: typeOr, ...restTarget } = targetMediaFilter as any;
                 const oldMedias = await MediaModel.find({
-                    ...targetMediaFilter,
-                    [`prewarm.${pop}.prewarmAt`]: { $lt: cutoff },
+                    ...restTarget,
+                    $and: [
+                        { $or: typeOr },
+                        {
+                            $or: [
+                                { [`prewarm.${pop}`]: { $exists: false } },
+                                { [`prewarm.${pop}.prewarmAt`]: { $lt: cutoff } },
+                            ],
+                        },
+                        // fra-first: pop อื่นแตะได้เฉพาะ media ที่ fra warm แล้ว
+                        ...(pop !== "fra"
+                            ? [{ "prewarm.fra.prewarmAt": { $exists: true } }]
+                            : []),
+                    ],
                     ...(excludeIds.size > 0 ? { _id: { $nin: [...excludeIds] } } : {}),
                 })
-                    .sort({ [`prewarm.${pop}.prewarmAt`]: 1 }) // เก่าสุดก่อน
+                    .sort({ [`prewarm.${pop}.prewarmAt`]: 1 })
                     .limit(slotsOld * 3)
                     .select({ _id: 1, fileId: 1, slug: 1, type: 1, resolution: 1 })
                     .lean();
