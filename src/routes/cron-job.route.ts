@@ -6,6 +6,7 @@ import { getPrewarmPending } from '@/services/cron-job/get-prewarm-pending.servi
 import { getTranscodePending } from '@/services/cron-job/get-transcode-pending.service';
 import { releaseStaleJobs } from '@/services/cron-job/release-stale-jobs.service';
 import { cleanupDeletedIngests } from '@/services/cron-job/cleanup-deleted-ingests.service';
+import { cleanupDeletedMedias } from '@/services/cron-job/cleanup-deleted-medias.service';
 import { cleanupDeletedFiles } from '@/services/cron-job/cleanup-deleted-files.service';
 import { archiveCompletedProcesses } from '@/services/cron-job/archive-completed-processes.service';
 import { updateWorkspaceUsage } from '@/services/cron-job/update-workspace-usage.service';
@@ -99,6 +100,15 @@ router.get('/archive-completed-processes', async (req: Request, res: Response) =
 router.get('/cleanup-deleted-ingests', async (req: Request, res: Response) => {
     try {
         const result = await cleanupDeletedIngests();
+        return res.status(200).json(result);
+    } catch (error) {
+        return res.status(500).json({ error });
+    }
+});
+
+router.get('/cleanup-deleted-medias', async (req: Request, res: Response) => {
+    try {
+        const result = await cleanupDeletedMedias();
         return res.status(200).json(result);
     } catch (error) {
         return res.status(500).json({ error });

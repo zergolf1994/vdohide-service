@@ -7,6 +7,7 @@ import { getTranscodePending } from "@/services/cron-job/get-transcode-pending.s
 import { getPrewarmPending } from "@/services/cron-job/get-prewarm-pending.service"
 import { releaseStaleJobs } from "@/services/cron-job/release-stale-jobs.service"
 import { cleanupDeletedIngests } from "@/services/cron-job/cleanup-deleted-ingests.service"
+import { cleanupDeletedMedias } from "@/services/cron-job/cleanup-deleted-medias.service"
 import { cleanupDeletedFiles } from "@/services/cron-job/cleanup-deleted-files.service"
 import { archiveCompletedProcesses } from "@/services/cron-job/archive-completed-processes.service"
 import { updateWorkspaceUsage } from "@/services/cron-job/update-workspace-usage.service"
@@ -63,8 +64,12 @@ schedule.scheduleJob("55 */5 * * * *", runEnqueuer("cleanup:files", cleanupDelet
 schedule.scheduleJob("15 */5 * * * *", runEnqueuer("archive:processes", archiveCompletedProcesses));
 
 // usage: รวม files.size ราย workspace → workspaces.capacity.used
-schedule.scheduleJob("45 */5 * * * *", runEnqueuer("update:workspace-usage", updateWorkspaceUsage));
+schedule.scheduleJob("45 * * * * *", runEnqueuer("update:workspace-usage", updateWorkspaceUsage));
 
 // originals: rendition = highest ติดตั้งแล้ว → soft-delete media original
 // (storage-node เป็นคนลบไฟล์จริงตาม refcount)
 schedule.scheduleJob("40 */5 * * * *", runEnqueuer("cleanup:originals", cleanupOriginalMedia));
+
+// medias: media ที่ soft-delete แล้ว "บน S3" → ลบ object จริง (m3u8+segments) แล้วลบ doc
+// (local ปล่อยให้ storage-node จัดการ refcount เอง — S3 มันเข้าไม่ถึง)
+schedule.scheduleJob("50 */5 * * * *", runEnqueuer("cleanup:medias", cleanupDeletedMedias));
