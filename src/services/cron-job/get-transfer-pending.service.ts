@@ -14,18 +14,22 @@ import { getSettingsByNames } from "../setting/get-setting.service";
 interface TransferConfig {
     enabled: boolean;
     slotRate: number;
+    /** เต็มเกินกี่ % = ไม่รับไฟล์ใหม่ (cutoff) — worker ยังมี safety guard ที่สูงกว่า */
+    maxPercent: number;
+    /** ช่วง % ที่ถือว่า "ว่างพอๆ กัน" แล้วกระจายงาน — กว้าง = spread หลาย storage */
+    balanceGap: number;
 }
 
 const default_transfer_config: TransferConfig = {
     enabled: true,
     slotRate: 2,
+    maxPercent: 95,
+    balanceGap: 8,
 };
 
 // ─── Storage balance ─────────────────────────────────────────
-// เลือก storage ปลายทางให้ไฟล์: เอาตัวที่ % ต่ำสุด (±2%) แล้วกระจาย
+// เลือก storage ปลายทางให้ไฟล์: เอาตัวที่ % ต่ำสุด (±gap) แล้วกระจาย
 // tie ด้วย fnv1a(fileId) — deterministic ทุกที่คำนวณได้ตรงกัน
-const STORAGE_BALANCE_MARGIN_PERCENT = 2;
-
 const fnv1a32 = (s: string): number => {
     let h = 0x811c9dc5;
     for (let i = 0; i < s.length; i++) {
@@ -37,13 +41,13 @@ const fnv1a32 = (s: string): number => {
 
 const capacityPercent = (s: any): number => s?.capacity?.percentage ?? 0;
 
-const pickBalancedStorage = (fileId: string, storages: any[]): string | null => {
+const pickBalancedStorage = (fileId: string, storages: any[], balanceGap: number): string | null => {
     if (storages.length === 0) return null;
     if (storages.length === 1) return storages[0]._id;
 
     const minPct = Math.min(...storages.map(capacityPercent));
     const candidates = storages
-        .filter((s) => capacityPercent(s) <= minPct + STORAGE_BALANCE_MARGIN_PERCENT)
+        .filter((s) => capacityPercent(s) <= minPct + balanceGap)
         .sort((a, b) => String(a._id).localeCompare(String(b._id)));
 
     return candidates[fnv1a32(fileId) % candidates.length]._id;
@@ -65,7 +69,7 @@ export const getTransferPending = async () => {
         }
 
         const [storages, workers] = await Promise.all([
-            getLocalStorages(),
+            getLocalStorages(transfer_config.maxPercent),
             getWorkers({ type: WorkerType.TRANSFER }),
         ]);
 
@@ -150,7 +154,7 @@ export const getTransferPending = async () => {
         // จ่ายงานตาม balance + ตัดตาม slot คงเหลือราย storage
         const docs: any[] = [];
         for (const f of files as any[]) {
-            const target = pickBalancedStorage(String(f._id), targetableStorages);
+            const target = pickBalancedStorage(String(f._id), targetableStorages, transfer_config.balanceGap);
             if (!target) continue;
             const remain = slotsByStorage.get(target) ?? 0;
             if (remain <= 0) continue;

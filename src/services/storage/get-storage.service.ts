@@ -1,17 +1,18 @@
 import { StorageAccept, StorageStatus, StorageType } from "@/core/enums";
 import { StorageModel } from "@/db/models";
 
-// local storage ที่รับไฟล์เพิ่มได้ (transfer ปลายทาง) — เต็มเกิน 90% = ไม่รับ
-const STORAGE_CAPACITY_MAX_PERCENT = 90;
+// local storage ที่รับไฟล์เพิ่มได้ (transfer ปลายทาง) — เต็มเกิน cutoff = ไม่รับ
+// cutoff ปรับได้ที่ transfer_config.maxPercent (service เป็นเจ้าของค่า) default 95
+const DEFAULT_MAX_PERCENT = 95;
 
-export const getLocalStorages = async () => {
+export const getLocalStorages = async (maxPercent: number = DEFAULT_MAX_PERCENT) => {
     try {
         const storages = await StorageModel.find({
             enable: true,
             status: StorageStatus.ONLINE,
             type: StorageType.LOCAL,
             $or: [
-                { "capacity.percentage": { $lt: STORAGE_CAPACITY_MAX_PERCENT } },
+                { "capacity.percentage": { $lt: maxPercent } },
                 { "capacity.percentage": { $exists: false } },
                 { capacity: { $exists: false } },
             ],
