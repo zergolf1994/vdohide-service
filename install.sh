@@ -123,7 +123,9 @@ cd "$APP_DIR"
 
 # ─── Download release tarball (dist + package.json + lock) ────
 print_status "Downloading service.tar.gz from latest release..."
-curl -fsSL "$RELEASES_URL/service.tar.gz" -o /tmp/${APP_NAME}.tar.gz
+# --retry: กัน GitHub release CDN สะดุดชั่วคราว (เช่น 504 gateway timeout)
+curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+    "$RELEASES_URL/service.tar.gz" -o /tmp/${APP_NAME}.tar.gz
 rm -rf "$APP_DIR/dist"
 tar -xzf /tmp/${APP_NAME}.tar.gz -C "$APP_DIR"
 rm -f /tmp/${APP_NAME}.tar.gz
