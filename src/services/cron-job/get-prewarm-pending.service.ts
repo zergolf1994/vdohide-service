@@ -54,8 +54,9 @@ const targetMediaFilter = {
     ],
 };
 
-// ช่องเก่า sort ด้วย prewarm.{pop}.prewarmAt (media ที่ไม่มี field = null มา
-// ก่อน) — ต้องเป็น index แบบไม่ sparse ถึงครอบ doc ที่ยังไม่เคย warm ด้วย
+// ช่องเก่ากรอง+sort ด้วย prewarm.{pop}.prewarmAt (เอาเฉพาะ doc ที่มี field
+// จริงและเก่ากว่า cutoff) — index ตัวนี้คือตัวที่ทำให้ query ไม่ต้องสแกนทั้ง
+// collection
 const ensuredPopIndexes = new Set<string>();
 const ensureReprewarmIndex = async (pop: string) => {
     if (ensuredPopIndexes.has(pop)) return;
@@ -129,12 +130,13 @@ export const getPrewarmPending = async () => {
         const summary: Record<string, any> = {};
 
         for (const [pop, ws] of popWorkers) {
-            // คิวแยกโควตาตามชนิดงาน — เหมือน bi-level scheduler ของระบบเก่า
-            //   reprewarm: prewarm_old_max_concurrent "ต่อเครื่อง" — 10 เครื่อง
-            //   × 5 = 50 งานค้างได้พร้อมกัน
-            //   media ที่ยังไม่เคย warm (firstWarm): จำกัด prewarm_max_concurrent
-            //   "ต่อ storage" — warm ครั้งแรก CF ต้อง MISS ไปดูดจาก origin จริง
-            //   ถ้าปล่อยพร้อมกันเยอะจะกินแบนด์วิดท์ (1Gbps) ของ storage นั้น
+            // สองช่องคิดคนละโควตา ไม่แย่งกัน — bi-level scheduler แบบระบบเก่า
+            //   new (ยังไม่เคย warm): prewarm_max_concurrent "ต่อ storage"
+            //     — warm ครั้งแรก CF ต้อง MISS ไปดูดจาก origin จริง ปล่อยเยอะ
+            //     พร้อมกันจะกินแบนด์วิดท์ (1Gbps) ของ storage นั้น
+            //   reprewarm (warm แล้ว เก่ากว่า cutoff): prewarm_old_max_concurrent
+            //     "ต่อเครื่อง" — ส่วนใหญ่ CF ยัง HIT อยู่ ไม่แตะ origin
+            //     จึงไม่ต้องคิดโควตาต่อ storage
             const [openNew, openOld] = await Promise.all([
                 PrewarmQueueModel.countDocuments({ pop, kind: "new" }),
                 PrewarmQueueModel.countDocuments({ pop, kind: "reprewarm" }),
@@ -143,7 +145,9 @@ export const getPrewarmPending = async () => {
                 ? cfg.prewarm_old_max_concurrent * ws.length * QUEUE_BUFFER - openOld
                 : 0;
 
-            // โควตา firstWarm ที่ใช้ไปแล้วต่อ storage (นับงานค้างทุกชนิด)
+            // โควตา firstWarm ที่ใช้ไปแล้วต่อ storage — ตอนนี้มีแต่งาน kind:"new"
+            // ที่ประทับ firstWarm (ช่อง reprewarm ไม่ประทับแล้ว) แต่ยังนับจาก
+            // field นี้เพื่อให้ doc เก่าที่ค้างคิวอยู่ก่อนแก้ยังถูกนับด้วย
             // × QUEUE_BUFFER เหมือนช่องเก่า — งานจบใน 10-20 วิ ถ้าคิวมีแค่ 1
             // worker จะว่างรอรอบ cron 40-50 วิ; เติมล่วงหน้าให้ทำต่อเนื่องได้
             const capPerStorage = cfg.prewarm_max_concurrent * QUEUE_BUFFER;
@@ -221,10 +225,12 @@ export const getPrewarmPending = async () => {
                 }
             }
 
-            // ── ช่องเก่า: กวาดคลังคู่ขนานกับช่อง new — ทั้งตัวที่ยังไม่เคย
-            // warm บน pop นี้ (backlog) และตัวที่ warm แล้วแก่เกิน cutoff
-            // sort ด้วย prewarmAt (ไม่มี field = null มาก่อน) → backlog ไหล
-            // ผ่านช่องนี้จนหมด แล้วช่องนี้กลายเป็น re-warm ตามอายุล้วนๆ
+            // ── ช่องเก่า: warm ซ้ำเฉพาะตัวที่ "เคย warm แล้ว" และเก่ากว่า cutoff
+            // ไม่รวม backlog (ยังไม่เคย warm) เพราะ:
+            //   1) doc ที่ไม่มี field จะถูก sort เป็น null = มาก่อนสุดเสมอ พอมี
+            //      backlog เยอะ ตัวที่ถึงเวลา re-warm จริงจะไม่โผล่ใน limit เลย
+            //   2) backlog กินแบนด์วิดท์ origin จึงต้องคุมด้วยโควตาต่อ storage
+            //      ซึ่งเป็นงานของช่อง new อยู่แล้ว — เอามาปนทำให้ช่องนี้ตัน
             if (slotsOld > 0 && cfg.reprewarm_age_minutes > 0) {
                 await ensureReprewarmIndex(pop);
                 const cutoff = new Date(Date.now() - cfg.reprewarm_age_minutes * 60_000);
@@ -233,12 +239,7 @@ export const getPrewarmPending = async () => {
                     ...restTarget,
                     $and: [
                         { $or: typeOr },
-                        {
-                            $or: [
-                                { [`prewarm.${pop}`]: { $exists: false } },
-                                { [`prewarm.${pop}.prewarmAt`]: { $lt: cutoff } },
-                            ],
-                        },
+                        { [`prewarm.${pop}.prewarmAt`]: { $lt: cutoff } },
                         // fra-first: pop อื่นแตะได้เฉพาะ media ที่ fra warm แล้ว
                         ...(pop !== "fra"
                             ? [{ "prewarm.fra.prewarmAt": { $exists: true } }]
@@ -262,10 +263,7 @@ export const getPrewarmPending = async () => {
                     if (pickedOld >= slotsOld) break;
                     const fileSlug = oldFileSlugs.get(String(m.fileId));
                     if (!fileSlug) continue;
-                    // backlog (ยังไม่เคย warm) กินแบนด์วิดท์ origin เท่างาน new
-                    // — ใช้โควตาต่อ storage ร่วมกัน; re-warm ตามอายุไม่จำกัด
-                    const firstWarm = !m.prewarm?.[pop]?.prewarmAt;
-                    if (firstWarm && !takeStorageSlot(m.storageId)) continue;
+                    // ไม่แตะโควตาต่อ storage — ช่องนี้คุมด้วย slotsOld ของตัวเอง
                     pickedOld++;
                     enqueueDocs.push({
                         mediaId: m._id,
@@ -275,7 +273,6 @@ export const getPrewarmPending = async () => {
                         type: m.type,
                         resolution: m.resolution,
                         storageId: m.storageId,
-                        ...(firstWarm ? { firstWarm: true } : {}),
                         pop,
                         kind: "reprewarm",
                         status: "pending",
