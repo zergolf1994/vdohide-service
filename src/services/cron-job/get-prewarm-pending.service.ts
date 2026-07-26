@@ -144,7 +144,9 @@ export const getPrewarmPending = async () => {
                 : 0;
 
             // โควตา firstWarm ที่ใช้ไปแล้วต่อ storage (นับงานค้างทุกชนิด)
-            const capPerStorage = cfg.prewarm_max_concurrent;
+            // × QUEUE_BUFFER เหมือนช่องเก่า — งานจบใน 10-20 วิ ถ้าคิวมีแค่ 1
+            // worker จะว่างรอรอบ cron 40-50 วิ; เติมล่วงหน้าให้ทำต่อเนื่องได้
+            const capPerStorage = cfg.prewarm_max_concurrent * QUEUE_BUFFER;
             const usedAgg = await PrewarmQueueModel.aggregate([
                 { $match: { pop, firstWarm: true } },
                 { $group: { _id: "$storageId", n: { $sum: 1 } } },
