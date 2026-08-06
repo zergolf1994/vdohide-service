@@ -3,7 +3,9 @@ import { StorageType } from "@/core/enums";
 import { IngestModel, StorageModel } from "@/db/models";
 import { applyPrefix, deleteVersions, listAllVersions, s3ClientFor } from "./s3-cleanup.helper";
 
-const BATCH_SIZE = 20;
+// One migration creates one deleted ingest per media. Process enough objects
+// per pass to keep up with a drain while bounding S3 list/delete requests.
+const BATCH_SIZE = 100;
 
 // key เดียวกับฝั่ง Go worker: ingest.path เป็น source of truth
 // (fallback {fileId}/{fileName} สำหรับ doc เก่า) + เติม s3.prefix ถ้ายังไม่มี

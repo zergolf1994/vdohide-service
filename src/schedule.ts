@@ -56,9 +56,9 @@ schedule.scheduleJob("50 * * * * *", runEnqueuer("enqueuer:prewarm", getPrewarmP
 // reaper: worker ตายคางาน (heartbeat ขาดเกิน 3 นาที) → คืนงานเข้าคิว
 schedule.scheduleJob("5 * * * * *", runEnqueuer("reaper", releaseStaleJobs));
 
-// cleanup ทุก 5 นาที (เหลื่อมวินาทีกัน): ลบ object บน S3 ของ ingest ที่
-// soft-delete แล้ว → ลบ doc | file ที่ลบแล้วไม่เหลือ ingest/media → ลบ doc
-schedule.scheduleJob("35 */5 * * * *", runEnqueuer("cleanup:ingests", cleanupDeletedIngests));
+// ingest cleanup ทุก 1 นาที: ลบ object บน S3 ของ ingest ที่ soft-delete แล้ว
+// file cleanup ทุก 5 นาที: ลบ doc ที่ไม่เหลือ ingest/media อ้างอิง
+schedule.scheduleJob("35 * * * * *", runEnqueuer("cleanup:ingests", cleanupDeletedIngests));
 schedule.scheduleJob("55 */5 * * * *", runEnqueuer("cleanup:files", cleanupDeletedFiles));
 
 // archive: completed ค้างเกิน 5 นาที → ย้ายไป video_process_history (TTL 30 วัน)

@@ -54,6 +54,7 @@ const ingestSchema = new Schema(
 );
 
 ingestSchema.index({ fileId: 1, status: 1 });
+ingestSchema.index({ deletedAt: 1 });
 ingestSchema.index(
     { migrationId: 1, sourceMediaId: 1 },
     {
