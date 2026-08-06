@@ -232,6 +232,7 @@ export const getStorageDrainPending = async () => {
 
             const unsupportedCount = await MediaModel.countDocuments({
                 storageId: storage._id,
+                clonedFrom: { $exists: false },
                 deletedAt: { $exists: false },
                 type: { $nin: [MediaType.VIDEO, MediaType.THUMBNAIL] },
             });
@@ -298,6 +299,7 @@ export const getStorageDrainPending = async () => {
             const [remainingMedia, openJobs, failedJobs, remainingMigration, pendingDeletion] = await Promise.all([
                 MediaModel.countDocuments({
                     storageId: storage._id,
+                    clonedFrom: { $exists: false },
                     deletedAt: { $exists: false },
                 }),
                 VideoProcessModel.countDocuments({
