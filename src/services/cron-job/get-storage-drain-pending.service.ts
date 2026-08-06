@@ -106,7 +106,7 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
 
     const mediaGroups = await MediaModel.aggregate<{
         _id: string;
-        sourceMediaIds: string[];
+        sourceMediaId: string;
     }>([
         {
             $match: {
@@ -116,10 +116,14 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
                 deletedAt: { $exists: false },
             },
         },
+        { $sort: { createdAt: 1, _id: 1 } },
         {
             $group: {
                 _id: "$fileId",
-                sourceMediaIds: { $addToSet: "$_id" },
+                // One file can have several renditions. Drain exactly one
+                // root media per queue chain, then let the next cron pass
+                // schedule the next rendition after cleanup completes.
+                sourceMediaId: { $first: "$_id" },
             },
         },
         { $sort: { _id: 1 } },
@@ -163,8 +167,8 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
                 status: VideoProcessStatus.PENDING,
                 sourceStorageId: storage._id,
                 tempStorageId,
-                migrationId: `${storage._id}:${requestedAt}:${group._id}`,
-                sourceMediaIds: group.sourceMediaIds,
+                migrationId: `${storage._id}:${requestedAt}:${group.sourceMediaId}`,
+                sourceMediaIds: [group.sourceMediaId],
                 timeline: timelineFor(TransferMode.EVACUATE),
             };
         });
@@ -202,7 +206,7 @@ const finishCancellingDrain = async (storage: DrainStorage, sourceSlots: number)
         cleanupEnqueued = await enqueueCleanup(storage, Math.max(0, sourceSlots - openSourceJobs));
     }
 
-    const [openJobs, failedJobs, remainingMigration] = await Promise.all([
+    const [openJobs, failedJobs, remainingMigration, pendingDeletion] = await Promise.all([
         VideoProcessModel.countDocuments({
             processType: WorkerType.TRANSFER,
             sourceStorageId: storage._id,
@@ -220,9 +224,13 @@ const finishCancellingDrain = async (storage: DrainStorage, sourceSlots: number)
             sourceStorageId: storage._id,
             deletedAt: { $exists: false },
         }),
+        MediaModel.countDocuments({
+            storageId: storage._id,
+            deletedAt: { $exists: true, $ne: null },
+        }),
     ]);
 
-    if (openJobs === 0 && failedJobs === 0 && remainingMigration === 0) {
+    if (openJobs === 0 && failedJobs === 0 && remainingMigration === 0 && pendingDeletion === 0) {
         await StorageModel.updateOne(
             {
                 _id: storage._id,
@@ -367,7 +375,7 @@ export const getStorageDrainPending = async () => {
 
             enqueued += await enqueueEvacuate(storage, String(temp._id), Math.max(0, availableSlots - cleanupEnqueued));
 
-            const [remainingMedia, openJobs, failedJobs, remainingMigration] = await Promise.all([
+            const [remainingMedia, openJobs, failedJobs, remainingMigration, pendingDeletion] = await Promise.all([
                 MediaModel.countDocuments({
                     storageId: storage._id,
                     deletedAt: { $exists: false },
@@ -389,9 +397,19 @@ export const getStorageDrainPending = async () => {
                     sourceStorageId: storage._id,
                     deletedAt: { $exists: false },
                 }),
+                MediaModel.countDocuments({
+                    storageId: storage._id,
+                    deletedAt: { $exists: true, $ne: null },
+                }),
             ]);
 
-            if (remainingMedia === 0 && openJobs === 0 && failedJobs === 0 && remainingMigration === 0) {
+            if (
+                remainingMedia === 0 &&
+                openJobs === 0 &&
+                failedJobs === 0 &&
+                remainingMigration === 0 &&
+                pendingDeletion === 0
+            ) {
                 await StorageModel.updateOne(
                     {
                         _id: storage._id,
