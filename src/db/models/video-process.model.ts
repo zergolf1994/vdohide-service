@@ -86,8 +86,9 @@ videoProcessSchema.index({ status: 1, claimedAt: 1 });
 // (loop รอบก่อนยังไม่จบแล้วรอบใหม่เริ่มทับ) index นี้คือตัวรับประกันจริง insert ซ้ำได้ E11000
 // partial เฉพาะงานที่ยังค้าง — จบแล้ว fileId เดิมเข้าคิวใหม่ได้ (retry / re-encode)
 videoProcessSchema.index(
-    { fileId: 1, processType: 1 },
+    { fileId: 1, processType: 1, migrationId: 1 },
     {
+        name: "uq_open_process_per_migration",
         unique: true,
         partialFilterExpression: { status: { $in: VIDEO_PROCESS_OPEN_STATUSES } },
     }
@@ -98,3 +99,22 @@ export type VideoProcessSchemaType = InferSchemaType<typeof videoProcessSchema>;
 export const VideoProcessModel: Model<VideoProcessSchemaType> =
     (models?.VideoProcess as Model<VideoProcessSchemaType>) ||
     model<VideoProcessSchemaType>("VideoProcess", videoProcessSchema);
+
+export const ensureVideoProcessQueueIndex = async () => {
+    await VideoProcessModel.collection.createIndex(
+        { fileId: 1, processType: 1, migrationId: 1 },
+        {
+            name: "uq_open_process_per_migration",
+            unique: true,
+            partialFilterExpression: {
+                status: { $in: VIDEO_PROCESS_OPEN_STATUSES },
+            },
+        }
+    );
+
+    const legacyIndex = "fileId_1_processType_1";
+    const indexes = await VideoProcessModel.collection.indexes();
+    if (indexes.some((index) => index.name === legacyIndex)) {
+        await VideoProcessModel.collection.dropIndex(legacyIndex);
+    }
+};

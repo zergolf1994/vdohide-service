@@ -5,6 +5,7 @@ import path from 'path';
 import dbConnect from '@/db/conn/mongoose';
 import ApiRoutes from '@/routes';
 import '@/schedule'
+import { ensureVideoProcessQueueIndex } from '@/db/models/video-process.model';
 
 // Load environment variables
 dotenv.config();
@@ -16,6 +17,7 @@ const app = express();
 async function initializeDatabase() {
     try {
         await dbConnect();
+        await ensureVideoProcessQueueIndex();
         console.log('✅ Database connection established');
     } catch (error) {
         console.error('❌ Database connection failed:', error);

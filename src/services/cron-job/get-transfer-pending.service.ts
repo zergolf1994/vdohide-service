@@ -111,7 +111,14 @@ export const getTransferPending = async () => {
 
         // candidate = ไฟล์ที่มี ingest processed ค้าง และไม่มีงาน transfer
         // ค้าง/failed (failed = รอ admin สั่ง retry) และ download จบแล้ว
-        const [pendingIngestFileIds, blockedFileIds, downloadingFileIds] = await Promise.all([
+        const [
+            pendingIngestFileIds,
+            normalIngestFileIds,
+            blockedFileIds,
+            blockedMigrationIds,
+            openMigrationInstallFileIds,
+            downloadingFileIds,
+        ] = await Promise.all([
             IngestModel.distinct("fileId", {
                 $or: [
                     { sourceType: IngestSourceType.PROCESSED },
@@ -122,8 +129,13 @@ export const getTransferPending = async () => {
                 ],
                 deletedAt: { $exists: false },
             }),
+            IngestModel.distinct("fileId", {
+                sourceType: IngestSourceType.PROCESSED,
+                deletedAt: { $exists: false },
+            }),
             VideoProcessModel.distinct("fileId", {
                 processType: WorkerType.TRANSFER,
+                migrationId: { $exists: false },
                 // failed/cancelled = terminal ที่ต้องรอ admin สั่ง retry ที่ doc เดิม
                 // — ห้ามเติมคิวใหม่เอง ไม่งั้น cancel แล้วเด้งกลับมาใน 20 วิ
                 status: {
@@ -133,6 +145,23 @@ export const getTransferPending = async () => {
                         VideoProcessStatus.CANCELLED,
                     ],
                 },
+            }),
+            VideoProcessModel.distinct("migrationId", {
+                processType: WorkerType.TRANSFER,
+                migrationId: { $exists: true },
+                status: {
+                    $in: [
+                        ...VIDEO_PROCESS_OPEN_STATUSES,
+                        VideoProcessStatus.FAILED,
+                        VideoProcessStatus.CANCELLED,
+                    ],
+                },
+            }),
+            VideoProcessModel.distinct("fileId", {
+                processType: WorkerType.TRANSFER,
+                transferMode: TransferMode.INSTALL,
+                migrationId: { $exists: true },
+                status: { $in: VIDEO_PROCESS_OPEN_STATUSES },
             }),
             VideoProcessModel.distinct("fileId", {
                 processType: WorkerType.DOWNLOAD,
@@ -164,36 +193,52 @@ export const getTransferPending = async () => {
                 fileId: { $in: files.map((file) => file._id) },
                 sourceType: IngestSourceType.MIGRATION,
                 migrationState: IngestMigrationState.STAGED,
+                migrationId: { $nin: blockedMigrationIds },
                 deletedAt: { $exists: false },
             },
             { fileId: 1, migrationId: 1, sourceStorageId: 1, sourceMediaId: 1 }
-        ).lean();
+        )
+            .sort({ createdAt: 1, _id: 1 })
+            .lean();
         const migrationByFile = new Map<string, {
             migrationId: string;
             sourceStorageId: string;
             sourceMediaIds: string[];
         }>();
+        const openMigrationInstallFiles = new Set(openMigrationInstallFileIds.map(String));
+        const normalIngestFiles = new Set(normalIngestFileIds.map(String));
         for (const ingest of migrationIngests as any[]) {
             const fileId = String(ingest.fileId);
-            const current = migrationByFile.get(fileId) ?? {
+            if (
+                migrationByFile.has(fileId) ||
+                openMigrationInstallFiles.has(fileId)
+            ) {
+                continue;
+            }
+            migrationByFile.set(fileId, {
                 migrationId: String(ingest.migrationId),
                 sourceStorageId: String(ingest.sourceStorageId),
-                sourceMediaIds: [],
-            };
-            if (ingest.sourceMediaId) current.sourceMediaIds.push(String(ingest.sourceMediaId));
-            migrationByFile.set(fileId, current);
+                sourceMediaIds: ingest.sourceMediaId
+                    ? [String(ingest.sourceMediaId)]
+                    : [],
+            });
         }
 
         // จ่ายงานตาม balance + ตัดตาม slot คงเหลือราย storage
         const docs: any[] = [];
         for (const f of files as any[]) {
-            const target = pickBalancedStorage(String(f._id), targetableStorages, transfer_config.balanceGap);
+            const fileId = String(f._id);
+            if (openMigrationInstallFiles.has(fileId)) continue;
+
+            const migration = migrationByFile.get(fileId);
+            if (!migration && !normalIngestFiles.has(fileId)) continue;
+
+            const target = pickBalancedStorage(fileId, targetableStorages, transfer_config.balanceGap);
             if (!target) continue;
             const remain = slotsByStorage.get(target) ?? 0;
             if (remain <= 0) continue;
             slotsByStorage.set(target, remain - 1);
 
-            const migration = migrationByFile.get(String(f._id));
             docs.push({
                 fileId: f._id,
                 spaceId: f.spaceId,

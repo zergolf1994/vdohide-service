@@ -1,5 +1,4 @@
 import {
-    IngestMigrationState,
     IngestSourceType,
     MediaType,
     StorageDrainState,
@@ -35,74 +34,24 @@ const timelineFor = (mode: TransferMode) => {
     };
 };
 
-const enqueueCleanup = async (storage: DrainStorage, slots: number) => {
+const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slots: number) => {
     if (slots <= 0) return 0;
 
-    const installed = await IngestModel.aggregate<{
-        _id: { fileId: string; migrationId: string };
-        sourceMediaIds: string[];
-    }>([
-        {
-            $match: {
-                sourceType: IngestSourceType.MIGRATION,
-                migrationState: IngestMigrationState.INSTALLED,
-                sourceStorageId: storage._id,
-                deletedAt: { $exists: false },
-            },
-        },
-        {
-            $group: {
-                _id: { fileId: "$fileId", migrationId: "$migrationId" },
-                sourceMediaIds: { $addToSet: "$sourceMediaId" },
-            },
-        },
-        { $limit: slots * 3 },
-    ]);
-
-    if (installed.length === 0) return 0;
-    const ids = installed.map((item) => item._id.fileId);
-    const blocked = new Set(
-        await VideoProcessModel.distinct("fileId", {
-            fileId: { $in: ids },
+    const [stagedMediaIds, blockedMediaIds] = await Promise.all([
+        IngestModel.distinct("sourceMediaId", {
+            sourceType: IngestSourceType.MIGRATION,
+            sourceStorageId: storage._id,
+            deletedAt: { $exists: false },
+        }),
+        VideoProcessModel.distinct("sourceMediaIds", {
             processType: WorkerType.TRANSFER,
+            sourceStorageId: storage._id,
             status: {
                 $in: [...VIDEO_PROCESS_OPEN_STATUSES, VideoProcessStatus.FAILED, VideoProcessStatus.CANCELLED],
             },
         }),
-    );
-    const files = await FileModel.find({ _id: { $in: ids } }, { spaceId: 1, slug: 1 }).lean();
-    const fileMap = new Map(files.map((file) => [String(file._id), file]));
-
-    const docs = installed
-        .filter((item) => !blocked.has(item._id.fileId))
-        .slice(0, slots)
-        .map((item) => {
-            const file = fileMap.get(item._id.fileId);
-            return {
-                fileId: item._id.fileId,
-                spaceId: file?.spaceId,
-                slug: file?.slug,
-                processType: WorkerType.TRANSFER,
-                transferMode: TransferMode.CLEANUP,
-                status: VideoProcessStatus.PENDING,
-                sourceStorageId: storage._id,
-                migrationId: item._id.migrationId,
-                sourceMediaIds: item.sourceMediaIds.filter(Boolean),
-                timeline: timelineFor(TransferMode.CLEANUP),
-            };
-        });
-
-    if (docs.length === 0) return 0;
-    try {
-        return (await VideoProcessModel.insertMany(docs, { ordered: false })).length;
-    } catch (error: any) {
-        if (error?.code !== 11000 && error?.writeErrors === undefined) throw error;
-        return error?.insertedDocs?.length ?? 0;
-    }
-};
-
-const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slots: number) => {
-    if (slots <= 0) return 0;
+    ]);
+    const excludedMediaIds = [...new Set([...stagedMediaIds, ...blockedMediaIds].map(String))];
 
     const mediaGroups = await MediaModel.aggregate<{
         _id: string;
@@ -114,6 +63,7 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
                 fileId: { $exists: true },
                 clonedFrom: { $exists: false },
                 deletedAt: { $exists: false },
+                ...(excludedMediaIds.length > 0 ? { _id: { $nin: excludedMediaIds } } : {}),
             },
         },
         { $sort: { createdAt: 1, _id: 1 } },
@@ -121,8 +71,8 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
             $group: {
                 _id: "$fileId",
                 // One file can have several renditions. Drain exactly one
-                // root media per queue chain, then let the next cron pass
-                // schedule the next rendition after cleanup completes.
+                // root media per EVACUATE queue. Once local → Temp completes,
+                // the next rendition may be staged without waiting for INSTALL.
                 sourceMediaId: { $first: "$_id" },
             },
         },
@@ -132,29 +82,11 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
 
     if (mediaGroups.length === 0) return 0;
     const ids = mediaGroups.map((group) => group._id);
-    const blocked = new Set(
-        await VideoProcessModel.distinct("fileId", {
-            fileId: { $in: ids },
-            processType: WorkerType.TRANSFER,
-            status: {
-                $in: [...VIDEO_PROCESS_OPEN_STATUSES, VideoProcessStatus.FAILED, VideoProcessStatus.CANCELLED],
-            },
-        }),
-    );
-    const staged = new Set(
-        await IngestModel.distinct("fileId", {
-            fileId: { $in: ids },
-            sourceType: IngestSourceType.MIGRATION,
-            sourceStorageId: storage._id,
-            deletedAt: { $exists: false },
-        }),
-    );
     const files = await FileModel.find({ _id: { $in: ids } }, { spaceId: 1, slug: 1 }).lean();
     const fileMap = new Map(files.map((file) => [String(file._id), file]));
     const requestedAt = storage.drainRequestedAt?.getTime() ?? 0;
 
     const docs = mediaGroups
-        .filter((group) => !blocked.has(group._id) && !staged.has(group._id))
         .slice(0, slots)
         .map((group) => {
             const file = fileMap.get(group._id);
@@ -195,17 +127,6 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
 };
 
 const finishCancellingDrain = async (storage: DrainStorage, sourceSlots: number) => {
-    const openSourceJobs = await VideoProcessModel.countDocuments({
-        processType: WorkerType.TRANSFER,
-        status: { $in: VIDEO_PROCESS_OPEN_STATUSES },
-        sourceStorageId: storage._id,
-    });
-
-    let cleanupEnqueued = 0;
-    if (sourceSlots > 0) {
-        cleanupEnqueued = await enqueueCleanup(storage, Math.max(0, sourceSlots - openSourceJobs));
-    }
-
     const [openJobs, failedJobs, remainingMigration, pendingDeletion] = await Promise.all([
         VideoProcessModel.countDocuments({
             processType: WorkerType.TRANSFER,
@@ -250,7 +171,7 @@ const finishCancellingDrain = async (storage: DrainStorage, sourceSlots: number)
                 },
             },
         );
-        return cleanupEnqueued;
+        return 0;
     }
 
     const drainError =
@@ -268,7 +189,7 @@ const finishCancellingDrain = async (storage: DrainStorage, sourceSlots: number)
         drainError ? { $set: { drainError } } : { $unset: { drainError: "" } },
     );
 
-    return cleanupEnqueued;
+    return 0;
 };
 
 export const getStorageDrainPending = async () => {
@@ -349,10 +270,9 @@ export const getStorageDrainPending = async () => {
                 processType: WorkerType.TRANSFER,
                 status: { $in: VIDEO_PROCESS_OPEN_STATUSES },
                 sourceStorageId: storage._id,
+                transferMode: { $in: [TransferMode.EVACUATE, TransferMode.CLEANUP] },
             });
             const availableSlots = Math.max(0, sourceSlots - openSourceJobs);
-            const cleanupEnqueued = await enqueueCleanup(storage, availableSlots);
-            enqueued += cleanupEnqueued;
 
             const temp = storage.drainTempStorageId
                 ? (tempStorages.data as any[]).find((item) => String(item._id) === storage.drainTempStorageId)
@@ -373,7 +293,7 @@ export const getStorageDrainPending = async () => {
                 continue;
             }
 
-            enqueued += await enqueueEvacuate(storage, String(temp._id), Math.max(0, availableSlots - cleanupEnqueued));
+            enqueued += await enqueueEvacuate(storage, String(temp._id), availableSlots);
 
             const [remainingMedia, openJobs, failedJobs, remainingMigration, pendingDeletion] = await Promise.all([
                 MediaModel.countDocuments({
