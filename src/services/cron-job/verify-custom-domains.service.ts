@@ -143,6 +143,12 @@ const dueFilter = (now: Date) => ({
     $and: [
         {
             $or: [
+                { spaceId: { $exists: true, $nin: [null, ""] } },
+                { creatorId: { $exists: true, $nin: [null, ""] } },
+            ],
+        },
+        {
+            $or: [
                 { "dns.nextVerifyAt": { $exists: false } },
                 { "dns.nextVerifyAt": { $lte: now } },
             ],

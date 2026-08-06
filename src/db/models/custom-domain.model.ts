@@ -10,6 +10,7 @@ const customDomainSchema = new Schema(
         name: { type: String, required: true },
         status: { type: String, enum: Object.values(DomainStatus) },
         spaceId: { type: String },
+        creatorId: { type: String },
         slug: { type: String, required: true },
         dns: {
             type: new Schema(
