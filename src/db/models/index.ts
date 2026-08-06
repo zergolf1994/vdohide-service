@@ -11,3 +11,5 @@ export * from "./workspace.model";
 export * from "./storage.model";
 export * from "./setting.model";
 export * from "./custom-domain.model";
+export * from "./api-key.model";
+export * from "./workspace-member.model";

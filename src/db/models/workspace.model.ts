@@ -7,6 +7,25 @@ import { Schema, model, models, InferSchemaType, type Model } from "mongoose";
 const workspaceSchema = new Schema(
     {
         _id: { type: String, required: true },
+        creatorId: { type: String },
+        metadata: {
+            type: new Schema(
+                {
+                    deletedAt: { type: Date },
+                    deletedBy: { type: String },
+                },
+                { _id: false }
+            ),
+        },
+        plan: {
+            type: new Schema(
+                {
+                    planType: { type: String },
+                    expiresAt: { type: Date },
+                },
+                { _id: false }
+            ),
+        },
         capacity: {
             type: new Schema(
                 {

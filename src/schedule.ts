@@ -13,6 +13,8 @@ import { archiveCompletedProcesses } from "@/services/cron-job/archive-completed
 import { updateWorkspaceUsage } from "@/services/cron-job/update-workspace-usage.service"
 import { cleanupOriginalMedia } from "@/services/cron-job/cleanup-original-media.service"
 import { getStorageDrainPending } from "@/services/cron-job/get-storage-drain-pending.service"
+import { cleanupDeletedWorkspaces } from "@/services/cron-job/cleanup-deleted-workspaces.service"
+import { verifyCustomDomains } from "@/services/cron-job/verify-custom-domains.service"
 
 // enqueuer หนึ่งตัวต่อหนึ่ง cron — กันรอบใหม่ทับรอบเก่า + log เฉพาะตอนสถานะเปลี่ยน
 const runEnqueuer = (name: string, fn: () => Promise<{ message?: string; data?: any } | undefined>) => {
@@ -59,7 +61,7 @@ schedule.scheduleJob("5 * * * * *", runEnqueuer("reaper", releaseStaleJobs));
 // ingest cleanup ทุก 1 นาที: ลบ object บน S3 ของ ingest ที่ soft-delete แล้ว
 // file cleanup ทุก 5 นาที: ลบ doc ที่ไม่เหลือ ingest/media อ้างอิง
 schedule.scheduleJob("35 * * * * *", runEnqueuer("cleanup:ingests", cleanupDeletedIngests));
-schedule.scheduleJob("55 */5 * * * *", runEnqueuer("cleanup:files", cleanupDeletedFiles));
+schedule.scheduleJob("30 */2 * * * *", runEnqueuer("cleanup:files", cleanupDeletedFiles));
 
 // archive: completed ค้างเกิน 5 นาที → ย้ายไป video_process_history (TTL 30 วัน)
 // คิวหลักเหลือแต่งาน active + failed/cancelled
@@ -75,3 +77,10 @@ schedule.scheduleJob("40 */5 * * * *", runEnqueuer("cleanup:originals", cleanupO
 // medias: media ที่ soft-delete แล้ว "บน S3" → ลบ object จริง (m3u8+segments) แล้วลบ doc
 // (local ปล่อยให้ storage-node จัดการ refcount เอง — S3 มันเข้าไม่ถึง)
 schedule.scheduleJob("50 */5 * * * *", runEnqueuer("cleanup:medias", cleanupDeletedMedias));
+
+// workspaces: hobby waits 10 minutes; paid plans wait until both deletion and
+// subscription expiry. Child files are drained by the existing cleanup jobs.
+schedule.scheduleJob("12 * * * * *", runEnqueuer("cleanup:workspaces", cleanupDeletedWorkspaces));
+
+// custom domains: cron only claims records whose dns.nextVerifyAt is due.
+schedule.scheduleJob("32 * * * * *", runEnqueuer("verify:domains", verifyCustomDomains));

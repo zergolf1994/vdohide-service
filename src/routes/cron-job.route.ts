@@ -12,6 +12,8 @@ import { archiveCompletedProcesses } from '@/services/cron-job/archive-completed
 import { updateWorkspaceUsage } from '@/services/cron-job/update-workspace-usage.service';
 import { cleanupOriginalMedia, cleanupOriginalMediaFull } from '@/services/cron-job/cleanup-original-media.service';
 import { getStorageDrainPending } from '@/services/cron-job/get-storage-drain-pending.service';
+import { cleanupDeletedWorkspaces } from '@/services/cron-job/cleanup-deleted-workspaces.service';
+import { verifyCustomDomains } from '@/services/cron-job/verify-custom-domains.service';
 
 const router = Router();
 
@@ -128,6 +130,24 @@ router.get('/cleanup-deleted-medias', async (req: Request, res: Response) => {
 router.get('/cleanup-deleted-files', async (req: Request, res: Response) => {
     try {
         const result = await cleanupDeletedFiles();
+        return res.status(200).json(result);
+    } catch (error) {
+        return res.status(500).json({ error });
+    }
+});
+
+router.get('/cleanup-deleted-workspaces', async (req: Request, res: Response) => {
+    try {
+        const result = await cleanupDeletedWorkspaces();
+        return res.status(200).json(result);
+    } catch (error) {
+        return res.status(500).json({ error });
+    }
+});
+
+router.get('/verify-custom-domains', async (req: Request, res: Response) => {
+    try {
+        const result = await verifyCustomDomains();
         return res.status(200).json(result);
     } catch (error) {
         return res.status(500).json({ error });

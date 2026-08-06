@@ -1,7 +1,7 @@
 import { DomainStatus } from '@/core/enums';
 import { InferSchemaType, model, models, Schema, type Model } from 'mongoose';
 
-// Partial schema for read-only access from vdohide-service.
+// Partial schema for domain verification and workspace cleanup.
 // Indexes are owned by the main vdohide repository and must not be declared here.
 const customDomainSchema = new Schema(
     {
@@ -9,6 +9,21 @@ const customDomainSchema = new Schema(
         enable: { type: Boolean, default: false },
         name: { type: String, required: true },
         status: { type: String, enum: Object.values(DomainStatus) },
+        spaceId: { type: String },
+        slug: { type: String, required: true },
+        dns: {
+            type: new Schema(
+                {
+                    retryCount: { type: Number, default: 0 },
+                    lastCheckedAt: { type: Date },
+                    lastVerified: { type: Date },
+                    nextVerifyAt: { type: Date },
+                    checkLockedUntil: { type: Date },
+                    reason: { type: String },
+                },
+                { _id: false }
+            ),
+        },
     },
     {
         timestamps: false,
