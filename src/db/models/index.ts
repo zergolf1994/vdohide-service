@@ -10,3 +10,4 @@ export * from "./workspace.model";
 
 export * from "./storage.model";
 export * from "./setting.model";
+export * from "./custom-domain.model";
