@@ -14,6 +14,7 @@ export enum StorageDrainState {
     IDLE = "idle",
     REQUESTED = "requested",
     DRAINING = "draining",
+    CANCELLING = "cancelling",
     BLOCKED = "blocked",
     COMPLETED = "completed",
 }
