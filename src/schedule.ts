@@ -12,6 +12,7 @@ import { cleanupDeletedFiles } from "@/services/cron-job/cleanup-deleted-files.s
 import { archiveCompletedProcesses } from "@/services/cron-job/archive-completed-processes.service"
 import { updateWorkspaceUsage } from "@/services/cron-job/update-workspace-usage.service"
 import { cleanupOriginalMedia } from "@/services/cron-job/cleanup-original-media.service"
+import { getStorageDrainPending } from "@/services/cron-job/get-storage-drain-pending.service"
 
 // enqueuer หนึ่งตัวต่อหนึ่ง cron — กันรอบใหม่ทับรอบเก่า + log เฉพาะตอนสถานะเปลี่ยน
 const runEnqueuer = (name: string, fn: () => Promise<{ message?: string; data?: any } | undefined>) => {
@@ -45,6 +46,7 @@ const runEnqueuer = (name: string, fn: () => Promise<{ message?: string; data?: 
 // เหลื่อมวินาทีกัน — ไม่ยิง DB พร้อมกันเป๊ะทุกรอบ
 schedule.scheduleJob("*/20 * * * * *", runEnqueuer("enqueuer:download", getDownloadOriginal));
 schedule.scheduleJob("10,30,50 * * * * *", runEnqueuer("enqueuer:transfer", getTransferPending));
+schedule.scheduleJob("0,20,40 * * * * *", runEnqueuer("enqueuer:storage-drain", getStorageDrainPending));
 schedule.scheduleJob("15,45 * * * * *", runEnqueuer("enqueuer:spritesheet", getSpritesheetPending));
 schedule.scheduleJob("25,55 * * * * *", runEnqueuer("enqueuer:transcode", getTranscodePending));
 // prewarm งานไม่รีบเท่าตัวอื่น (ผู้ชมเล่นได้อยู่แล้ว แค่ช้ากว่าตอน MISS)

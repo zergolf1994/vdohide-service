@@ -1,6 +1,6 @@
 import { InferSchemaType, model, models, Schema, type Model } from "mongoose";
 import { v4 as uuidv4 } from "uuid";
-import { StorageType, StorageStatus, StorageAccept } from "@/core/enums";
+import { StorageType, StorageStatus, StorageAccept, StorageDrainState } from "@/core/enums";
 
 // ─── Local Storage Config ────────────────────────────────────────────
 // สำหรับ Nginx VOD server ที่เข้าถึงผ่าน SSH
@@ -51,6 +51,16 @@ const storageSchema = new Schema(
             enum: Object.values(StorageStatus),
             default: StorageStatus.OFFLINE,
         },
+        drainState: {
+            type: String,
+            required: true,
+            enum: Object.values(StorageDrainState),
+            default: StorageDrainState.IDLE,
+        },
+        drainTempStorageId: { type: String, ref: "Storage" },
+        drainRequestedAt: { type: Date },
+        drainCompletedAt: { type: Date },
+        drainError: { type: String },
 
         // Discriminated config — ใช้ field ตาม type
         // type = "local" → ใช้ local config
@@ -78,6 +88,7 @@ const storageSchema = new Schema(
 
 // ─── Indexes ─────────────────────────────────────────────────────────
 storageSchema.index({ type: 1, status: 1 });
+storageSchema.index({ type: 1, drainState: 1 });
 
 export type StorageSchemaType = InferSchemaType<typeof storageSchema>;
 export const StorageModel: Model<StorageSchemaType> =

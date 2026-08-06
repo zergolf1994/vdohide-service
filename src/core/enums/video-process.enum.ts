@@ -8,6 +8,12 @@ export enum VideoProcessStatus {
     CANCELLED = "cancelled",
 }
 
+export enum TransferMode {
+    INSTALL = "install",
+    EVACUATE = "evacuate",
+    CLEANUP = "cleanup",
+}
+
 // งานที่ยัง "ค้าง" (ยังไม่จบ) — ใช้ 2 ที่ที่ต้องตรงกันเสมอ:
 //   1. partial unique index บน {fileId, processType} (กันเติมคิวซ้ำไฟล์เดิม)
 //   2. ตอน enqueuer หา fileId ที่ยังค้างเพื่อตัดออกก่อน insert

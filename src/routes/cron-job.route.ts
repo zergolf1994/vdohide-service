@@ -11,6 +11,7 @@ import { cleanupDeletedFiles } from '@/services/cron-job/cleanup-deleted-files.s
 import { archiveCompletedProcesses } from '@/services/cron-job/archive-completed-processes.service';
 import { updateWorkspaceUsage } from '@/services/cron-job/update-workspace-usage.service';
 import { cleanupOriginalMedia, cleanupOriginalMediaFull } from '@/services/cron-job/cleanup-original-media.service';
+import { getStorageDrainPending } from '@/services/cron-job/get-storage-drain-pending.service';
 
 const router = Router();
 
@@ -26,6 +27,15 @@ router.get('/download-original', async (req: Request, res: Response) => {
 router.get('/transfer-pending', async (req: Request, res: Response) => {
     try {
         const result = await getTransferPending();
+        return res.status(200).json(result);
+    } catch (error) {
+        return res.status(500).json({ error });
+    }
+});
+
+router.get('/storage-drain-pending', async (req: Request, res: Response) => {
+    try {
+        const result = await getStorageDrainPending();
         return res.status(200).json(result);
     } catch (error) {
         return res.status(500).json({ error });

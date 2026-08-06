@@ -1,7 +1,9 @@
 import {
     FileStatus,
     FileType,
+    IngestMigrationState,
     IngestSourceType,
+    TransferMode,
     VideoProcessStatus,
     VIDEO_PROCESS_OPEN_STATUSES,
     WorkerType,
@@ -111,7 +113,13 @@ export const getTransferPending = async () => {
         // ค้าง/failed (failed = รอ admin สั่ง retry) และ download จบแล้ว
         const [pendingIngestFileIds, blockedFileIds, downloadingFileIds] = await Promise.all([
             IngestModel.distinct("fileId", {
-                sourceType: IngestSourceType.PROCESSED,
+                $or: [
+                    { sourceType: IngestSourceType.PROCESSED },
+                    {
+                        sourceType: IngestSourceType.MIGRATION,
+                        migrationState: IngestMigrationState.STAGED,
+                    },
+                ],
                 deletedAt: { $exists: false },
             }),
             VideoProcessModel.distinct("fileId", {
@@ -151,6 +159,31 @@ export const getTransferPending = async () => {
             .select({ _id: 1, spaceId: 1, slug: 1 })
             .lean();
 
+        const migrationIngests = await IngestModel.find(
+            {
+                fileId: { $in: files.map((file) => file._id) },
+                sourceType: IngestSourceType.MIGRATION,
+                migrationState: IngestMigrationState.STAGED,
+                deletedAt: { $exists: false },
+            },
+            { fileId: 1, migrationId: 1, sourceStorageId: 1, sourceMediaId: 1 }
+        ).lean();
+        const migrationByFile = new Map<string, {
+            migrationId: string;
+            sourceStorageId: string;
+            sourceMediaIds: string[];
+        }>();
+        for (const ingest of migrationIngests as any[]) {
+            const fileId = String(ingest.fileId);
+            const current = migrationByFile.get(fileId) ?? {
+                migrationId: String(ingest.migrationId),
+                sourceStorageId: String(ingest.sourceStorageId),
+                sourceMediaIds: [],
+            };
+            if (ingest.sourceMediaId) current.sourceMediaIds.push(String(ingest.sourceMediaId));
+            migrationByFile.set(fileId, current);
+        }
+
         // จ่ายงานตาม balance + ตัดตาม slot คงเหลือราย storage
         const docs: any[] = [];
         for (const f of files as any[]) {
@@ -160,13 +193,22 @@ export const getTransferPending = async () => {
             if (remain <= 0) continue;
             slotsByStorage.set(target, remain - 1);
 
+            const migration = migrationByFile.get(String(f._id));
             docs.push({
                 fileId: f._id,
                 spaceId: f.spaceId,
                 slug: f.slug,
                 processType: WorkerType.TRANSFER,
                 status: VideoProcessStatus.PENDING,
+                transferMode: TransferMode.INSTALL,
                 targetStorageId: target,
+                ...(migration
+                    ? {
+                        sourceStorageId: migration.sourceStorageId,
+                        migrationId: migration.migrationId,
+                        sourceMediaIds: migration.sourceMediaIds,
+                    }
+                    : {}),
                 timeline: {
                     download: { status: "pending" },
                     extract: { status: "pending" },

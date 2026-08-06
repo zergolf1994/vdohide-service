@@ -31,6 +31,13 @@ export enum IngestSourceType {
     S3_IMPORT = "s3_import",
     // สร้างโดย worker (download/HLS) = ไฟล์ผลลัพธ์บน S3 temp รอ transfer ลง storage
     PROCESSED = "processed",
+    MIGRATION = "migration",
+}
+
+export enum IngestMigrationState {
+    STAGED = "staged",
+    INSTALLED = "installed",
+    CLEANED = "cleaned",
 }
 
 export enum IngestStatus {

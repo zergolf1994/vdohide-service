@@ -1,6 +1,6 @@
 import { Schema, model, models, InferSchemaType, type Model } from "mongoose";
 import { v4 as uuidv4 } from "uuid";
-import { VideoProcessStatus, VIDEO_PROCESS_OPEN_STATUSES, WorkerType } from "@/core/enums";
+import { TransferMode, VideoProcessStatus, VIDEO_PROCESS_OPEN_STATUSES, WorkerType } from "@/core/enums";
 
 // ─── video_process = คิว + ตัวงาน ในตัวเดียวกัน ─────────────────────
 // enqueuer สร้างเป็น status=pending → Go worker (server-download) claim เป็น processing
@@ -33,6 +33,15 @@ const videoProcessSchema = new Schema(
         // เฉพาะงาน transfer — enqueuer เลือก storage ปลายทาง (balance) แล้วประทับไว้
         // worker claim เฉพาะงานที่ targetStorageId = STORAGE_ID ของเครื่องตัวเอง
         targetStorageId: { type: String, ref: "Storage" },
+        transferMode: {
+            type: String,
+            enum: Object.values(TransferMode),
+            default: TransferMode.INSTALL,
+        },
+        sourceStorageId: { type: String, ref: "Storage" },
+        tempStorageId: { type: String, ref: "Storage" },
+        migrationId: { type: String },
+        sourceMediaIds: [{ type: String, ref: "Media" }],
         // worker เซ็ตตอน claim — reaper ใช้จับงานค้าง (worker ตายคาไว้)
         claimedAt: { type: Date },
         // fail แล้วรอ retry (backoff) — worker จะไม่ claim จนกว่าถึงเวลา
@@ -66,6 +75,7 @@ videoProcessSchema.index({ processType: 1, status: 1, priority: -1, createdAt: 1
 
 // transfer claim: เพิ่ม targetStorageId ใน filter (worker หยิบเฉพาะงานของ storage ตัวเอง)
 videoProcessSchema.index({ processType: 1, status: 1, targetStorageId: 1, priority: -1, createdAt: 1 });
+videoProcessSchema.index({ processType: 1, status: 1, transferMode: 1, sourceStorageId: 1, priority: -1, createdAt: 1 });
 
 // นับงานของ worker แต่ละตัว (slot) + reaper
 videoProcessSchema.index({ workerId: 1, status: 1 });

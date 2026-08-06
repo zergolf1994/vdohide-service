@@ -1,5 +1,5 @@
 import { Schema, model, models, InferSchemaType, type Model } from "mongoose";
-import { IngestSourceType, IngestStatus } from "@/core/enums";
+import { IngestMigrationState, IngestSourceType, IngestStatus } from "@/core/enums";
 import { v4 as uuidv4 } from "uuid";
 
 const ingestSchema = new Schema(
@@ -24,6 +24,14 @@ const ingestSchema = new Schema(
             enum: Object.values(IngestSourceType),
             default: IngestSourceType.UPLOAD,
         },
+        migrationId: { type: String, index: true },
+        migrationState: {
+            type: String,
+            enum: Object.values(IngestMigrationState),
+        },
+        sourceMediaId: { type: String, ref: "Media" },
+        sourceStorageId: { type: String, ref: "Storage", index: true },
+        sourcePath: { type: String },
 
         // ─── ปลายทางที่ resolve ไว้ตอนขอ upload URL ───────────────────
         // เก็บที่นี่เพราะ /save รับแค่ ingestId แล้วอ่านทุกอย่างจาก ingest
@@ -36,6 +44,7 @@ const ingestSchema = new Schema(
         purpose: { type: String },
         // path บน UI ปลายทาง — ส่งกลับเป็น `page` ให้ client นำทางหลังอัพเสร็จ
         relativePath: { type: String },
+        deletedAt: { type: Date }
     },
     {
         timestamps: true,
@@ -45,6 +54,16 @@ const ingestSchema = new Schema(
 );
 
 ingestSchema.index({ fileId: 1, status: 1 });
+ingestSchema.index(
+    { migrationId: 1, sourceMediaId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            sourceType: IngestSourceType.MIGRATION,
+            deletedAt: { $exists: false },
+        },
+    }
+);
 
 export type IngestSchemaType = InferSchemaType<typeof ingestSchema>;
 export const IngestModel: Model<IngestSchemaType> =

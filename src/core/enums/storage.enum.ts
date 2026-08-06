@@ -10,6 +10,14 @@ export enum StorageStatus {
     MAINTENANCE = "maintenance",
 }
 
+export enum StorageDrainState {
+    IDLE = "idle",
+    REQUESTED = "requested",
+    DRAINING = "draining",
+    BLOCKED = "blocked",
+    COMPLETED = "completed",
+}
+
 export enum StorageAccept {
     // บทบาท (Role)
     UPLOAD = "upload",     // รับอัพโหลดไฟล์
