@@ -3,6 +3,25 @@ import { CustomDomainModel, SettingModel } from '@/db/models';
 import { isIP } from 'node:net';
 
 const BUILT_IN_ALLOWED_DOMAINS = ['localhost'];
+const NON_DESKTOP_USER_AGENT_PATTERNS = [
+    '*mobile*',
+    '*phone*',
+    '*android*',
+    '*ipad*',
+    '*ipod*',
+    '*blackberry*',
+    '*bb10*',
+    '*tablet*',
+    '*playbook*',
+    '*silk*',
+    '*opera mini*',
+    '*windows ce*',
+    '*kaios*',
+    '*palm*',
+    '*avantgo*',
+    '*docomo*',
+    '*meego*',
+];
 const COUNTRY_CODE_SECOND_LEVEL_SUFFIXES = new Set([
     'ac',
     'co',
@@ -118,6 +137,21 @@ export const buildRefererBlockCondition = (
     ].join('\n');
 };
 
+export const buildDesktopUserAgentCondition = (indent = ''): string => {
+    const nonDesktopConditions = NON_DESKTOP_USER_AGENT_PATTERNS
+        .map((pattern) => `${indent}    http.user_agent wildcard "${pattern}"`)
+        .join(' or\n');
+
+    return [
+        `${indent}(`,
+        `${indent}  http.user_agent ne "" and`,
+        `${indent}  not (`,
+        nonDesktopConditions,
+        `${indent}  )`,
+        `${indent})`,
+    ].join('\n');
+};
+
 export const getAllowedRefererDomains = async (): Promise<string[]> => {
     const [domainPreviewSetting, customDomains] = await Promise.all([
         SettingModel.findOne(
@@ -150,6 +184,7 @@ export const buildM3u8RefererBlockRule = (
         '(',
         `  lower(http.host) eq "${requestHostname}" and`,
         '  ends_with(http.request.uri.path, ".m3u8") and',
+        `${buildDesktopUserAgentCondition('  ')} and`,
         buildRefererBlockCondition(allowedDomains, '  '),
         ')',
     ].join('\n');

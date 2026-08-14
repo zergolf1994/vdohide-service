@@ -83,4 +83,4 @@ schedule.scheduleJob("50 */5 * * * *", runEnqueuer("cleanup:medias", cleanupDele
 schedule.scheduleJob("12 * * * * *", runEnqueuer("cleanup:workspaces", cleanupDeletedWorkspaces));
 
 // custom domains: cron only claims records whose dns.nextVerifyAt is due.
-schedule.scheduleJob("32 * * * * *", runEnqueuer("verify:domains", verifyCustomDomains));
+// schedule.scheduleJob("32 * * * * *", runEnqueuer("verify:domains", verifyCustomDomains));

@@ -1,4 +1,5 @@
 import {
+    buildDesktopUserAgentCondition,
     buildRefererBlockCondition,
     getAllowedRefererDomains,
 } from './get-m3u8-referer-block-rule.service';
@@ -11,6 +12,7 @@ export const buildSegmentRefererBlockRule = (
     return [
         '(',
         `  http.request.uri.path wildcard "${SEGMENT_PATH_PATTERN}" and`,
+        `${buildDesktopUserAgentCondition('  ')} and`,
         buildRefererBlockCondition(allowedDomains, '  '),
         ')',
     ].join('\n');
