@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import dbConnect from '@/db/conn/mongoose';
 import ApiRoutes from '@/routes';
-// import '@/schedule'
+import '@/schedule'
 import { ensureVideoProcessQueueIndex } from '@/db/models/video-process.model';
 
 // Load environment variables
