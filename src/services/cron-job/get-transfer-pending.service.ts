@@ -57,6 +57,8 @@ const pickBalancedStorage = (fileId: string, storages: any[], balanceGap: number
 
 // enqueuer: ไฟล์ที่มี ingest "processed" ค้างบน S3 temp → เติมเป็นงาน transfer
 // pending พร้อม targetStorageId (worker claim เฉพาะงานของ storage ตัวเอง)
+// ถ้า permanent S3 มี worker ของตัวเอง ให้ worker นั้นติดตั้งตรงเข้า S3 ก่อน;
+// ถ้าไม่มีจึงใช้ local worker เป็น executor แล้วส่งต่อไป permanent S3
 // ยิงซ้ำได้ปลอดภัย — partial unique index {fileId, processType} กันซ้ำ
 export const getTransferPending = async () => {
     try {
@@ -76,7 +78,6 @@ export const getTransferPending = async () => {
             getWorkers({ type: WorkerType.TRANSFER }),
         ]);
 
-        if (storages.count === 0) return { message: "No local storage available" };
         if (workers.count === 0) return { message: "Worker transfer not ready" };
 
         // slot แยกราย storage — งานถูกผูกกับ storage ปลายทาง จ่ายข้ามเครื่องไม่ได้
@@ -104,9 +105,14 @@ export const getTransferPending = async () => {
             return { message: "Queue is full", data: { slotsByStorage: Object.fromEntries(slotsByStorage) } };
         }
 
-        // balance เฉพาะ storage ที่มี worker สดรองรับ — ไม่งั้นงานจะค้างคิวไม่มีคนหยิบ
-        const targetableStorages = (storages.data as any[]).filter((s) => slotsByStorage.has(s._id));
-        if (targetableStorages.length === 0) {
+        // executor มีได้สองแบบ:
+        // 1) worker ที่ผูกกับ permanent S3 เดียวกับปลายทาง (ทางตรงและควรเลือกก่อน)
+        // 2) worker ที่ผูกกับ local storage ทำหน้าที่อัปโหลดต่อไป permanent S3
+        // targetStorageId คือ executor เสมอ ส่วน destinationStorageId คือปลายทางจริง
+        const localExecutors = (storages.data as any[]).filter((s) => slotsByStorage.has(String(s._id)));
+        const permanentS3 = permanentS3Storages.data as any[];
+        const directS3Executors = permanentS3.filter((s) => slotsByStorage.has(String(s._id)));
+        if (localExecutors.length === 0 && directS3Executors.length === 0) {
             return { message: "No storage with alive transfer worker" };
         }
 
@@ -234,20 +240,27 @@ export const getTransferPending = async () => {
             const migration = migrationByFile.get(fileId);
             if (!migration && !normalIngestFiles.has(fileId)) continue;
 
-            // targetStorageId ยังคงหมายถึงเครื่อง worker ที่ต้อง claim งาน
-            // ส่วน destinationStorageId คือ S3 ถาวรที่ media จะไปอยู่จริง
-            // ถ้าไม่มี S3 พร้อมใช้ จะ fallback เป็น local แบบเดิม
-            const executor = pickBalancedStorage(fileId, targetableStorages, transfer_config.balanceGap);
+            // เลือกเฉพาะ executor ที่ยังเหลือ slot ป้องกัน hash ไปตก storage เต็ม
+            // แล้วข้ามงาน ทั้งที่ storage ตัวอื่นยังรับได้
+            const availableDirectS3 = directS3Executors.filter(
+                (storage) => (slotsByStorage.get(String(storage._id)) ?? 0) > 0,
+            );
+            const availableLocal = localExecutors.filter(
+                (storage) => (slotsByStorage.get(String(storage._id)) ?? 0) > 0,
+            );
+
+            // Permanent S3 ที่มี worker ผูก storageId เดียวกันรับงานโดยตรง
+            // targetStorageId และ destinationStorageId จึงเป็น ID เดียวกัน
+            const directS3 = pickBalancedStorage(fileId, availableDirectS3, transfer_config.balanceGap);
+            const executor = directS3 ?? pickBalancedStorage(fileId, availableLocal, transfer_config.balanceGap);
             if (!executor) continue;
             const remain = slotsByStorage.get(executor) ?? 0;
             if (remain <= 0) continue;
             slotsByStorage.set(executor, remain - 1);
 
-            const s3Destination = pickBalancedStorage(
-                fileId,
-                permanentS3Storages.data as any[],
-                transfer_config.balanceGap,
-            );
+            // ถ้าใช้ local executor ให้เลือก permanent S3 เป็นปลายทางถ้ามี;
+            // ถ้าไม่มี permanent S3 จะไม่ใส่ destinationStorageId และติดตั้ง local
+            const s3Destination = directS3 ?? pickBalancedStorage(fileId, permanentS3, transfer_config.balanceGap);
 
             docs.push({
                 fileId: f._id,
