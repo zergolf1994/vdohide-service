@@ -14,6 +14,7 @@ import { cleanupOriginalMedia, cleanupOriginalMediaFull } from '@/services/cron-
 import { getStorageDrainPending } from '@/services/cron-job/get-storage-drain-pending.service';
 import { cleanupDeletedWorkspaces } from '@/services/cron-job/cleanup-deleted-workspaces.service';
 import { verifyCustomDomains } from '@/services/cron-job/verify-custom-domains.service';
+import { repairOrphanedCloneGroups } from '@/services/cron-job/promote-clone-successors.service';
 
 const router = Router();
 
@@ -139,6 +140,15 @@ router.get('/cleanup-deleted-files', async (req: Request, res: Response) => {
 router.get('/cleanup-deleted-workspaces', async (req: Request, res: Response) => {
     try {
         const result = await cleanupDeletedWorkspaces();
+        return res.status(200).json(result);
+    } catch (error) {
+        return res.status(500).json({ error });
+    }
+});
+
+router.get('/repair-orphaned-clones', async (req: Request, res: Response) => {
+    try {
+        const result = await repairOrphanedCloneGroups();
         return res.status(200).json(result);
     } catch (error) {
         return res.status(500).json({ error });

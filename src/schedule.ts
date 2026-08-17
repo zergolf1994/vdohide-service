@@ -15,6 +15,7 @@ import { cleanupOriginalMedia } from "@/services/cron-job/cleanup-original-media
 import { getStorageDrainPending } from "@/services/cron-job/get-storage-drain-pending.service"
 import { cleanupDeletedWorkspaces } from "@/services/cron-job/cleanup-deleted-workspaces.service"
 import { verifyCustomDomains } from "@/services/cron-job/verify-custom-domains.service"
+import { repairOrphanedCloneGroups } from "@/services/cron-job/promote-clone-successors.service"
 
 // enqueuer หนึ่งตัวต่อหนึ่ง cron — กันรอบใหม่ทับรอบเก่า + log เฉพาะตอนสถานะเปลี่ยน
 const runEnqueuer = (name: string, fn: () => Promise<{ message?: string; data?: any } | undefined>) => {
@@ -81,6 +82,9 @@ schedule.scheduleJob("50 */5 * * * *", runEnqueuer("cleanup:medias", cleanupDele
 // workspaces: hobby waits 10 minutes; paid plans wait until both deletion and
 // subscription expiry. Child files are drained by the existing cleanup jobs.
 schedule.scheduleJob("12 * * * * *", runEnqueuer("cleanup:workspaces", cleanupDeletedWorkspaces));
+
+// Repair clone groups whose original File was deleted by an older release.
+schedule.scheduleJob("8 * * * * *", runEnqueuer("repair:clone-owners", repairOrphanedCloneGroups));
 
 // custom domains: cron only claims records whose dns.nextVerifyAt is due.
 // schedule.scheduleJob("32 * * * * *", runEnqueuer("verify:domains", verifyCustomDomains));

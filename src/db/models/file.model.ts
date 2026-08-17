@@ -53,6 +53,7 @@ fileSchema.index({ slug: 1, spaceId: 1 });
 // Admin queries — ไม่ scope ด้วย spaceId
 fileSchema.index({ parentId: 1, "metadata.trashedAt": 1, createdAt: -1 }); // admin files page
 fileSchema.index({ "metadata.trashedAt": 1, "metadata.deletedAt": 1, createdAt: -1 }); // admin trash + delete-permanent
+fileSchema.index({ clonedFrom: 1, "metadata.deletedAt": 1, "metadata.trashedAt": 1, createdAt: 1 }); // clone promotion/repair
 
 export type FileSchemaType = InferSchemaType<typeof fileSchema>;
 

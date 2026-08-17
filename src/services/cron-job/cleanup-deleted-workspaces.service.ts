@@ -8,6 +8,7 @@ import {
     WorkspaceMemberModel,
     WorkspaceModel,
 } from "@/db/models";
+import { promoteCloneSuccessors } from "./promote-clone-successors.service";
 
 const HOBBY_GRACE_MS = 1 * 60 * 1000;
 const WORKSPACE_BATCH_SIZE = 10;
@@ -78,6 +79,10 @@ export const cleanupDeletedWorkspaces = async () => {
 
             if (files.length > 0) {
                 const activeFileIds = files.map((file: any) => String(file._id));
+
+                // A clone outside this workspace must become the new logical
+                // owner before the original File/Media records are retired.
+                await promoteCloneSuccessors(activeFileIds, { excludeSpaceId: spaceId });
 
                 await Promise.all([
                     MediaModel.updateMany(
