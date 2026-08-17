@@ -174,8 +174,6 @@ const syncMissingCloneSprites = async () => {
                         fileId: String(clone._id),
                         clonedFrom: source.clonedFrom || sourceFileId,
                         metadata: source.metadata,
-                        createdAt: new Date(),
-                        updatedAt: new Date(),
                     },
                 },
                 upsert: true,
