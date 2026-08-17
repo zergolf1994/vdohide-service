@@ -106,6 +106,94 @@ export const promoteCloneSuccessors = async (
     return promoted;
 };
 
+const syncMissingCloneSprites = async () => {
+    const missing = await FileModel.aggregate([
+        {
+            $match: {
+                ...activeCloneFilter,
+                clonedFrom: { $exists: true, $nin: [null, ""] },
+            },
+        },
+        {
+            $lookup: {
+                from: "medias",
+                let: { cloneFileId: "$_id" },
+                pipeline: [
+                    {
+                        $match: {
+                            $expr: { $eq: ["$fileId", "$$cloneFileId"] },
+                            type: MediaType.THUMBNAIL,
+                            fileName: "sprite.vtt",
+                            deletedAt: { $exists: false },
+                        },
+                    },
+                    { $limit: 1 },
+                ],
+                as: "_sprite",
+            },
+        },
+        { $match: { "_sprite.0": { $exists: false } } },
+        { $project: { _id: 1, clonedFrom: 1 } },
+        { $limit: 500 },
+    ]);
+
+    if (missing.length === 0) return 0;
+
+    const sourceIds = [...new Set(missing.map((file: any) => String(file.clonedFrom)))];
+    const sourceSprites = await MediaModel.find({
+        fileId: { $in: sourceIds },
+        type: MediaType.THUMBNAIL,
+        fileName: "sprite.vtt",
+        deletedAt: { $exists: false },
+    }).lean();
+    const spriteBySource = new Map(
+        (sourceSprites as any[]).map((media) => [String(media.fileId), media]),
+    );
+
+    const operations = (missing as any[]).flatMap((clone) => {
+        const sourceFileId = String(clone.clonedFrom);
+        const source = spriteBySource.get(sourceFileId);
+        if (!source) return []; // source ยังไม่สร้าง sprite — worker จะกระจายให้ภายหลัง
+
+        return [{
+            updateOne: {
+                filter: {
+                    fileId: String(clone._id),
+                    type: MediaType.THUMBNAIL,
+                    fileName: "sprite.vtt",
+                    deletedAt: { $exists: false },
+                },
+                update: {
+                    $setOnInsert: {
+                        type: MediaType.THUMBNAIL,
+                        fileName: source.fileName,
+                        mimeType: source.mimeType,
+                        storageId: source.storageId,
+                        path: source.path,
+                        sourceHash: source.sourceHash,
+                        fileId: String(clone._id),
+                        clonedFrom: source.clonedFrom || sourceFileId,
+                        metadata: source.metadata,
+                        createdAt: new Date(),
+                        updatedAt: new Date(),
+                    },
+                },
+                upsert: true,
+            },
+        }];
+    });
+
+    if (operations.length === 0) return 0;
+
+    const result = await MediaModel.bulkWrite(operations, { ordered: false });
+    const synced = result.upsertedCount;
+
+    if (synced > 0) {
+        console.log(`[repair:clone-sprites] synced ${synced} missing sprite media record(s)`);
+    }
+    return synced;
+};
+
 // Repairs legacy groups where the source File document was already removed.
 export const repairOrphanedCloneGroups = async () => {
     const roots = await FileModel.distinct("clonedFrom", {
@@ -113,22 +201,23 @@ export const repairOrphanedCloneGroups = async () => {
         clonedFrom: { $exists: true, $nin: [null, ""] },
     });
 
-    if (roots.length === 0) return { message: "No clone groups" };
+    let orphaned: string[] = [];
+    let promoted = 0;
+    if (roots.length > 0) {
+        const existing = await FileModel.find({
+            _id: { $in: roots },
+            "metadata.deletedAt": { $exists: false },
+        })
+            .select({ _id: 1 })
+            .lean();
+        const existingIds = new Set((existing as any[]).map((file) => String(file._id)));
+        orphaned = roots.map(String).filter((id) => !existingIds.has(id)).slice(0, 100);
+        promoted = await promoteCloneSuccessors(orphaned);
+    }
+    const syncedSprites = await syncMissingCloneSprites();
 
-    const existing = await FileModel.find({
-        _id: { $in: roots },
-        "metadata.deletedAt": { $exists: false },
-    })
-        .select({ _id: 1 })
-        .lean();
-    const existingIds = new Set((existing as any[]).map((file) => String(file._id)));
-    const orphaned = roots.map(String).filter((id) => !existingIds.has(id)).slice(0, 100);
-
-    if (orphaned.length === 0) return { message: "No orphaned clone groups" };
-
-    const promoted = await promoteCloneSuccessors(orphaned);
     return {
-        message: promoted > 0 ? "Success" : "No orphaned clone groups",
-        data: { scanned: orphaned.length, promoted },
+        message: promoted > 0 || syncedSprites > 0 ? "Success" : "No clone repairs needed",
+        data: { scanned: orphaned.length, promoted, syncedSprites },
     };
 };
