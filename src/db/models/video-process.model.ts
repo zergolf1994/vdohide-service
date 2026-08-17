@@ -33,6 +33,9 @@ const videoProcessSchema = new Schema(
         // เฉพาะงาน transfer — enqueuer เลือก storage ปลายทาง (balance) แล้วประทับไว้
         // worker claim เฉพาะงานที่ targetStorageId = STORAGE_ID ของเครื่องตัวเอง
         targetStorageId: { type: String, ref: "Storage" },
+        // ปลายทางจริงของ media เมื่อ worker ของ local storage ทำหน้าที่เป็น
+        // executor ให้งาน S3; ถ้าไม่มี field นี้ targetStorageId คือปลายทาง
+        destinationStorageId: { type: String, ref: "Storage" },
         transferMode: {
             type: String,
             enum: Object.values(TransferMode),

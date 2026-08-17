@@ -68,6 +68,7 @@ const storageSchema = new Schema(
         local: { type: localConfigSchema },
         s3: { type: s3ConfigSchema },
         publicUrl: { type: String },
+        originUrl: { type: String },
         accepts: [{ type: String, enum: Object.values(StorageAccept) }],
 
         // Metadata & Stats

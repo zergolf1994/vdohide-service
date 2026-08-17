@@ -10,7 +10,7 @@ import {
     WorkerType,
 } from "@/core/enums";
 import { FileModel, IngestModel, MediaModel, StorageModel, VideoProcessModel } from "@/db/models";
-import { getTempStorages } from "../storage/get-storage.service";
+import { getPermanentS3Storages, getTempStorages } from "../storage/get-storage.service";
 import { getWorkers } from "../worker/get-workers.service";
 
 type DrainStorage = {
@@ -34,7 +34,12 @@ const timelineFor = (mode: TransferMode) => {
     };
 };
 
-const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slots: number) => {
+const enqueueEvacuate = async (
+    storage: DrainStorage,
+    tempStorageId: string | undefined,
+    destinationStorageId: string | undefined,
+    slots: number,
+) => {
     if (slots <= 0) return 0;
 
     const [stagedMediaIds, blockedMediaIds] = await Promise.all([
@@ -98,7 +103,8 @@ const enqueueEvacuate = async (storage: DrainStorage, tempStorageId: string, slo
                 transferMode: TransferMode.EVACUATE,
                 status: VideoProcessStatus.PENDING,
                 sourceStorageId: storage._id,
-                tempStorageId,
+                ...(tempStorageId ? { tempStorageId } : {}),
+                ...(destinationStorageId ? { destinationStorageId } : {}),
                 migrationId: `${storage._id}:${requestedAt}:${group.sourceMediaId}`,
                 sourceMediaIds: [group.sourceMediaId],
                 timeline: timelineFor(TransferMode.EVACUATE),
@@ -209,9 +215,10 @@ export const getStorageDrainPending = async () => {
 
         if (storages.length === 0) return { message: "No storage drain requested", data: { enqueued: 0 } };
 
-        const [workers, tempStorages] = await Promise.all([
+        const [workers, tempStorages, permanentS3Storages] = await Promise.all([
             getWorkers({ type: WorkerType.TRANSFER }),
             getTempStorages(),
+            getPermanentS3Storages(),
         ]);
         const workerSlots = new Map<string, number>();
         for (const worker of workers.data as any[]) {
@@ -275,10 +282,15 @@ export const getStorageDrainPending = async () => {
             });
             const availableSlots = Math.max(0, sourceSlots - openSourceJobs);
 
-            const temp = storage.drainTempStorageId
-                ? (tempStorages.data as any[]).find((item) => String(item._id) === storage.drainTempStorageId)
-                : (tempStorages.data as any[])[0];
-            if (!temp) {
+            // S3 ถาวรพร้อมใช้ → ย้ายตรงและ cut over ใน EVACUATE job เดียว
+            // ไม่มีจึง fallback ไป staging บน Temp ตาม flow เดิม
+            const destination = (permanentS3Storages.data as any[])[0];
+            const temp = destination
+                ? undefined
+                : storage.drainTempStorageId
+                  ? (tempStorages.data as any[]).find((item) => String(item._id) === storage.drainTempStorageId)
+                  : (tempStorages.data as any[])[0];
+            if (!destination && !temp) {
                 await StorageModel.updateOne(
                     {
                         _id: storage._id,
@@ -294,7 +306,12 @@ export const getStorageDrainPending = async () => {
                 continue;
             }
 
-            enqueued += await enqueueEvacuate(storage, String(temp._id), availableSlots);
+            enqueued += await enqueueEvacuate(
+                storage,
+                temp ? String(temp._id) : undefined,
+                destination ? String(destination._id) : undefined,
+                availableSlots,
+            );
 
             const [remainingMedia, openJobs, failedJobs, remainingMigration, pendingDeletion] = await Promise.all([
                 MediaModel.countDocuments({
@@ -365,13 +382,18 @@ export const getStorageDrainPending = async () => {
                         _id: storage._id,
                         drainState: { $ne: StorageDrainState.CANCELLING },
                     },
-                    {
-                        $set: {
-                            drainState: StorageDrainState.DRAINING,
-                            drainTempStorageId: String(temp._id),
+                    destination
+                        ? {
+                            $set: { drainState: StorageDrainState.DRAINING },
+                            $unset: { drainTempStorageId: "", drainError: "" },
+                        }
+                        : {
+                            $set: {
+                                drainState: StorageDrainState.DRAINING,
+                                drainTempStorageId: String(temp!._id),
+                            },
+                            $unset: { drainError: "" },
                         },
-                        $unset: { drainError: "" },
-                    },
                 );
             }
         }

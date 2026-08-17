@@ -9,7 +9,7 @@ import {
     WorkerType,
 } from "@/core/enums";
 import { FileModel, IngestModel, VideoProcessModel } from "@/db/models";
-import { getLocalStorages } from "../storage/get-storage.service";
+import { getLocalStorages, getPermanentS3Storages } from "../storage/get-storage.service";
 import { getWorkers } from "../worker/get-workers.service";
 import { getSettingsByNames } from "../setting/get-setting.service";
 
@@ -70,8 +70,9 @@ export const getTransferPending = async () => {
             return { message: "Transfer is disabled" };
         }
 
-        const [storages, workers] = await Promise.all([
+        const [storages, permanentS3Storages, workers] = await Promise.all([
             getLocalStorages(transfer_config.maxPercent),
+            getPermanentS3Storages(),
             getWorkers({ type: WorkerType.TRANSFER }),
         ]);
 
@@ -233,11 +234,20 @@ export const getTransferPending = async () => {
             const migration = migrationByFile.get(fileId);
             if (!migration && !normalIngestFiles.has(fileId)) continue;
 
-            const target = pickBalancedStorage(fileId, targetableStorages, transfer_config.balanceGap);
-            if (!target) continue;
-            const remain = slotsByStorage.get(target) ?? 0;
+            // targetStorageId ยังคงหมายถึงเครื่อง worker ที่ต้อง claim งาน
+            // ส่วน destinationStorageId คือ S3 ถาวรที่ media จะไปอยู่จริง
+            // ถ้าไม่มี S3 พร้อมใช้ จะ fallback เป็น local แบบเดิม
+            const executor = pickBalancedStorage(fileId, targetableStorages, transfer_config.balanceGap);
+            if (!executor) continue;
+            const remain = slotsByStorage.get(executor) ?? 0;
             if (remain <= 0) continue;
-            slotsByStorage.set(target, remain - 1);
+            slotsByStorage.set(executor, remain - 1);
+
+            const s3Destination = pickBalancedStorage(
+                fileId,
+                permanentS3Storages.data as any[],
+                transfer_config.balanceGap,
+            );
 
             docs.push({
                 fileId: f._id,
@@ -246,7 +256,8 @@ export const getTransferPending = async () => {
                 processType: WorkerType.TRANSFER,
                 status: VideoProcessStatus.PENDING,
                 transferMode: TransferMode.INSTALL,
-                targetStorageId: target,
+                targetStorageId: executor,
+                ...(s3Destination ? { destinationStorageId: s3Destination } : {}),
                 ...(migration
                     ? {
                         sourceStorageId: migration.sourceStorageId,
