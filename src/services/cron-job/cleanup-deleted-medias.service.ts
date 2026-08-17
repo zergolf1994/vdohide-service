@@ -1,13 +1,93 @@
 import { S3Client } from "@aws-sdk/client-s3";
-import { StorageType } from "@/core/enums";
+import { MediaType, StorageType } from "@/core/enums";
 import { MediaModel, StorageModel } from "@/db/models";
 import { applyPrefix, deleteVersions, listAllVersions, s3ClientFor } from "./s3-cleanup.helper";
 
 const BATCH_SIZE = 20;
 
-// key ฐานของ media: media.path เป็น source of truth (fallback {fileId}/{slug})
-const baseKeyFor = (media: any, prefix: string): string =>
-    applyPrefix(media.path || `${media.fileId}/${media.slug}`, prefix);
+const nonEmpty = (value: unknown): string =>
+    typeof value === "string" ? value.trim() : "";
+
+// clonedFrom ของ media ในระบบปัจจุบันเก็บ source fileId ที่เป็นเจ้าของ object จริง
+// (clone.fileId เป็น id ของ clone เอง) จึงต้อง resolve ผ่าน clonedFrom ก่อน
+const effectiveFileIdFor = (media: any): string =>
+    nonEmpty(media.clonedFrom) || nonEmpty(media.fileId);
+
+// Legacy media หลายตัวไม่มี path แต่ permanent S3 layout คือ:
+//   video/image/etc. -> {effectiveFileId}/{fileName}
+//   thumbnail       -> {effectiveFileId}/sprite/*
+const fallbackKeyFor = (media: any): string | null => {
+    const effectiveFileId = effectiveFileIdFor(media);
+    if (!effectiveFileId) return null;
+
+    if (media.type === MediaType.THUMBNAIL) {
+        return `${effectiveFileId}/sprite`;
+    }
+
+    const fileName = nonEmpty(media.fileName);
+    return fileName ? `${effectiveFileId}/${fileName}` : null;
+};
+
+// media.path เป็น source of truth; fallback รองรับ record เก่าและ worker
+// ที่ยังไม่ได้ persist path. ถ้า resolve ไม่ได้ต้องเก็บ doc ไว้ ห้ามเดาแล้วลบ
+const rawBaseKeyFor = (media: any): string | null =>
+    nonEmpty(media.path) || fallbackKeyFor(media);
+
+const missingPathFilter = {
+    $or: [
+        { path: { $exists: false } },
+        { path: null },
+        { path: "" },
+    ],
+};
+
+// นับ media ที่ยัง active และชี้ physical object เดียวกัน ครอบคลุมทั้ง:
+// - record ใหม่ที่ persist path เหมือนกัน
+// - record เก่าที่ต้อง derive จาก clonedFrom || fileId
+const countActiveReferences = async (
+    media: any,
+    rawBase: string,
+    fullBase: string,
+    prefix: string,
+): Promise<number> => {
+    const pathValues = [...new Set([rawBase, fullBase])];
+    const referenceClauses: any[] = [
+        { path: { $in: pathValues } },
+    ];
+
+    const fallback = fallbackKeyFor(media);
+    const effectiveFileId = effectiveFileIdFor(media);
+    // จะเทียบแบบ legacy ได้เมื่อ fallback ของ record นี้ชี้ object เดียวกับ path จริง
+    if (fallback && effectiveFileId && applyPrefix(fallback, prefix) === fullBase) {
+        const effectiveReference = {
+            $or: [
+                { clonedFrom: effectiveFileId },
+                {
+                    fileId: effectiveFileId,
+                    $or: [
+                        { clonedFrom: { $exists: false } },
+                        { clonedFrom: null },
+                        { clonedFrom: "" },
+                    ],
+                },
+            ],
+        };
+        const assetIdentity = media.type === MediaType.THUMBNAIL
+            ? { type: MediaType.THUMBNAIL }
+            : { fileName: nonEmpty(media.fileName) };
+
+        referenceClauses.push({
+            $and: [missingPathFilter, effectiveReference, assetIdentity],
+        });
+    }
+
+    return MediaModel.countDocuments({
+        _id: { $ne: media._id },
+        storageId: media.storageId,
+        deletedAt: { $exists: false },
+        $or: referenceClauses,
+    });
+};
 
 // cleanup: media ที่ soft-delete แล้ว (deletedAt) ซึ่งอยู่บน "S3" เท่านั้น →
 // ลบ object จริงบน S3 แล้วค่อยลบ doc
@@ -65,34 +145,29 @@ export const cleanupDeletedMedias = async () => {
                     continue;
                 }
 
-                // ── clone check: มี media อื่นที่ยังไม่ถูกลบ ใช้ path+storageId เดียวกันไหม ──
-                // media.clonedFrom → clone ชี้ object จริงตัวเดียวกัน ถ้ายังมีคนใช้อยู่
-                // ห้ามลบ S3 object (จะพัง clone) — ลบแค่ doc นี้พอ
-                if (media.path) {
-                    const activeClones = await MediaModel.countDocuments({
-                        _id: { $ne: media._id },
-                        storageId: media.storageId,
-                        path: media.path,
-                        deletedAt: { $exists: false },
-                    });
-                    if (activeClones > 0) {
-                        await MediaModel.deleteOne({ _id: media._id });
-                        skipped++;
-                        console.log(`[cleanup:medias] ${media._id}: ${activeClones} clone(s) still use ${media.path} — DB only`);
-                        continue;
-                    }
-                }
-
                 if (!clientCache.has(storage._id)) {
                     clientCache.set(storage._id, s3ClientFor(storage));
                 }
                 const client = clientCache.get(storage._id)!;
-                const base = baseKeyFor(media, storage.s3.prefix || "");
+                const rawBase = rawBaseKeyFor(media);
 
-                // กันลบทั้ง bucket ถ้า base ว่าง (media เพี้ยน — เก็บ doc ไว้ให้เช็คมือ)
-                if (!base) {
+                // กันลบทั้ง bucket/ทำ object orphan ถ้า media เพี้ยน
+                if (!rawBase) {
                     failed++;
                     console.error(`[cleanup:medias] ${media._id}: empty object key — skipped`);
+                    continue;
+                }
+                const prefix = storage.s3.prefix || "";
+                const base = applyPrefix(rawBase, prefix);
+
+                // ── ref check: original/clone ที่ยัง active ใช้ object เดียวกันไหม ──
+                // ถ้ายังมี ลบเฉพาะ soft-deleted media doc; object จะอยู่จน reference
+                // ตัวสุดท้ายถูกลบ
+                const activeReferences = await countActiveReferences(media, rawBase, base, prefix);
+                if (activeReferences > 0) {
+                    await MediaModel.deleteOne({ _id: media._id });
+                    skipped++;
+                    console.log(`[cleanup:medias] ${media._id}: ${activeReferences} active reference(s) still use ${base} — DB only`);
                     continue;
                 }
 
