@@ -71,13 +71,13 @@ schedule.scheduleJob("15 */5 * * * *", runEnqueuer("archive:processes", archiveC
 // usage: รวม files.size ราย workspace → workspaces.capacity.used
 schedule.scheduleJob("45 * * * * *", runEnqueuer("update:workspace-usage", updateWorkspaceUsage));
 
-// originals: rendition = highest ติดตั้งแล้ว → soft-delete media original
+// originals ทุก 1 นาที: rendition = highest ติดตั้งแล้ว → soft-delete media original
 // (storage-node เป็นคนลบไฟล์จริงตาม refcount)
-schedule.scheduleJob("40 */5 * * * *", runEnqueuer("cleanup:originals", cleanupOriginalMedia));
+schedule.scheduleJob("40 * * * * *", runEnqueuer("cleanup:originals", cleanupOriginalMedia));
 
-// medias: media ที่ soft-delete แล้ว "บน S3" → ลบ object จริง (m3u8+segments) แล้วลบ doc
+// medias ทุก 2 นาที: media ที่ soft-delete แล้ว "บน S3" → ลบ object จริงแล้วลบ doc
 // (local ปล่อยให้ storage-node จัดการ refcount เอง — S3 มันเข้าไม่ถึง)
-schedule.scheduleJob("50 */5 * * * *", runEnqueuer("cleanup:medias", cleanupDeletedMedias));
+schedule.scheduleJob("50 */2 * * * *", runEnqueuer("cleanup:medias", cleanupDeletedMedias));
 
 // workspaces: hobby waits 10 minutes; paid plans wait until both deletion and
 // subscription expiry. Child files are drained by the existing cleanup jobs.

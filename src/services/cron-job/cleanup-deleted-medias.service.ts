@@ -3,7 +3,7 @@ import { MediaType, StorageType } from "@/core/enums";
 import { MediaModel, StorageModel } from "@/db/models";
 import { applyPrefix, deleteVersions, listAllVersions, s3ClientFor } from "./s3-cleanup.helper";
 
-const BATCH_SIZE = 20;
+const BATCH_SIZE = 100;
 
 const nonEmpty = (value: unknown): string =>
     typeof value === "string" ? value.trim() : "";

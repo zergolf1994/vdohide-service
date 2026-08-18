@@ -55,7 +55,8 @@ const mediaSchema = new Schema(
     }
 );
 
-mediaSchema.index({ fileId: 1, resolution: 1 });
+mediaSchema.index({ fileId: 1, resolution: 1, type: 1, deletedAt: 1 });
+mediaSchema.index({ type: 1, resolution: 1, deletedAt: 1, _id: 1 }); // cleanup originals aggregation
 mediaSchema.index({ fileId: 1, type: 1, fileName: 1, deletedAt: 1 }); // clone media repair
 mediaSchema.index({ createdAt: -1 }); // admin medias page — sort by createdAt
 mediaSchema.index({ deletedAt: 1 }); // admin overview — countDocuments
