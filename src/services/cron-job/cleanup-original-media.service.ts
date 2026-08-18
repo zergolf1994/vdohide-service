@@ -86,13 +86,23 @@ const purgeOriginalsFor = async (fileIds: string[]) => {
     return { files: qualified.length, softDeleted: result.modifiedCount };
 };
 
-// ─── โหมดปกติ (cron): เฉพาะไฟล์ของงาน transfer ที่เพิ่งเสร็จ ───
+// ─── โหมดปกติ (cron): ไฟล์ของงาน transfer/transcode ที่เพิ่งเสร็จ ───
 export const cleanupOriginalMedia = async () => {
     try {
         // completed ยังไม่ถูก archive (หน้าต่าง ~10 นาที) — ใช้ index
         // {processType, status, ...} เดิม มีไม่กี่ doc เสมอ
+        //
+        // - transfer: rendition จาก Temp ถูกติดตั้งเป็น Media แล้ว
+        // - transcode: worker อาจสร้าง Permanent S3 Media โดยตรงโดยไม่มี
+        //   transfer job ตามหลัง จึงต้องเป็น candidate ด้วย
+        //
+        // transcode ที่ fallback ไป Temp ยังปลอดภัย: purgeOriginalsFor จะไม่
+        // soft-delete original จนกว่าจะพบ rendition = metadata.highest ใน Media
+        // จริง (Ingest อย่างเดียวไม่ผ่านเงื่อนไข)
         const fileIds = await VideoProcessModel.distinct("fileId", {
-            processType: WorkerType.TRANSFER,
+            processType: {
+                $in: [WorkerType.TRANSFER, WorkerType.TRANSCODE],
+            },
             status: VideoProcessStatus.COMPLETED,
         });
 
