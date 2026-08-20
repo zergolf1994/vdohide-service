@@ -121,6 +121,7 @@ export const getTransferPending = async () => {
         const [
             pendingIngestFileIds,
             normalIngestFileIds,
+            localFallbackFileIds,
             blockedFileIds,
             blockedMigrationIds,
             openMigrationInstallFileIds,
@@ -138,6 +139,11 @@ export const getTransferPending = async () => {
             }),
             IngestModel.distinct("fileId", {
                 sourceType: IngestSourceType.PROCESSED,
+                deletedAt: { $exists: false },
+            }),
+            IngestModel.distinct("fileId", {
+                sourceType: IngestSourceType.PROCESSED,
+                installTarget: "local",
                 deletedAt: { $exists: false },
             }),
             VideoProcessModel.distinct("fileId", {
@@ -214,6 +220,7 @@ export const getTransferPending = async () => {
         }>();
         const openMigrationInstallFiles = new Set(openMigrationInstallFileIds.map(String));
         const normalIngestFiles = new Set(normalIngestFileIds.map(String));
+        const localFallbackFiles = new Set(localFallbackFileIds.map(String));
         for (const ingest of migrationIngests as any[]) {
             const fileId = String(ingest.fileId);
             if (
@@ -251,7 +258,10 @@ export const getTransferPending = async () => {
 
             // Permanent S3 ที่มี worker ผูก storageId เดียวกันรับงานโดยตรง
             // targetStorageId และ destinationStorageId จึงเป็น ID เดียวกัน
-            const directS3 = pickBalancedStorage(fileId, availableDirectS3, transfer_config.balanceGap);
+            const forceLocal = localFallbackFiles.has(fileId);
+            const directS3 = forceLocal
+                ? null
+                : pickBalancedStorage(fileId, availableDirectS3, transfer_config.balanceGap);
             const executor = directS3 ?? pickBalancedStorage(fileId, availableLocal, transfer_config.balanceGap);
             if (!executor) continue;
             const remain = slotsByStorage.get(executor) ?? 0;
@@ -260,7 +270,9 @@ export const getTransferPending = async () => {
 
             // ถ้าใช้ local executor ให้เลือก permanent S3 เป็นปลายทางถ้ามี;
             // ถ้าไม่มี permanent S3 จะไม่ใส่ destinationStorageId และติดตั้ง local
-            const s3Destination = directS3 ?? pickBalancedStorage(fileId, permanentS3, transfer_config.balanceGap);
+            const s3Destination = forceLocal
+                ? null
+                : directS3 ?? pickBalancedStorage(fileId, permanentS3, transfer_config.balanceGap);
 
             docs.push({
                 fileId: f._id,

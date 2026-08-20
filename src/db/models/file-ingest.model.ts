@@ -32,6 +32,11 @@ const ingestSchema = new Schema(
         sourceMediaId: { type: String, ref: "Media" },
         sourceStorageId: { type: String, ref: "Storage", index: true },
         sourcePath: { type: String },
+        // processed asset contract used when durable S3 falls back to Temp
+        mediaType: { type: String },
+        resolution: { type: String },
+        mediaMetadata: { type: Schema.Types.Mixed },
+        installTarget: { type: String, enum: ["local"] },
 
         // ─── ปลายทางที่ resolve ไว้ตอนขอ upload URL ───────────────────
         // เก็บที่นี่เพราะ /save รับแค่ ingestId แล้วอ่านทุกอย่างจาก ingest

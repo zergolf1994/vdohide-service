@@ -10,6 +10,17 @@ const mediaMetadataSchema = new Schema(
         height: { type: Number, default: 0 },
         duration: { type: Number, default: 0 },
         directUrl: { type: String },
+        sourceIndex: { type: Number },
+        sourceCodec: { type: String },
+        codec: { type: String },
+        language: { type: String },
+        title: { type: String },
+        isDefault: { type: Boolean },
+        isForced: { type: Boolean },
+        channels: { type: Number },
+        sampleRate: { type: Number },
+        bitrate: { type: Number },
+        mediaLayout: { type: String, enum: ["muxed", "separated"] },
     },
     {
         _id: false
@@ -58,6 +69,7 @@ const mediaSchema = new Schema(
 mediaSchema.index({ fileId: 1, resolution: 1, type: 1, deletedAt: 1 });
 mediaSchema.index({ type: 1, resolution: 1, deletedAt: 1, _id: 1 }); // cleanup originals aggregation
 mediaSchema.index({ fileId: 1, type: 1, fileName: 1, deletedAt: 1 }); // clone media repair
+mediaSchema.index({ fileId: 1, type: 1, "metadata.sourceIndex": 1, deletedAt: 1 }); // separated audio/subtitle tracks
 mediaSchema.index({ createdAt: -1 }); // admin medias page — sort by createdAt
 mediaSchema.index({ deletedAt: 1 }); // admin overview — countDocuments
 

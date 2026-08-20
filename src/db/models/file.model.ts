@@ -21,6 +21,9 @@ const fileMetadataSchema = new Schema(
         sourceHash: { type: String, index: true },
         playlist: { type: String },
         purpose: { type: String },
+        mediaLayout: { type: String, enum: ["muxed", "separated"] },
+        audioTrackCount: { type: Number },
+        subtitleTrackCount: { type: Number },
     },
     {
         _id: false
