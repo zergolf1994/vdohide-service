@@ -43,14 +43,16 @@ const STALE_CLAIM_MS = 10 * 60 * 1000; // worker ตายคางาน → �
 // แต่ cron เติมทุก 1 นาที ถ้าคิว = จำนวน slot พอดี worker จะว่างรอรอบเติม
 const QUEUE_BUFFER = 3;
 
-// media ที่ warm ได้: วิดีโอทุก rendition
-// (sprite ถอดออกชั่วคราว — จะกลับมาเปิดทีหลัง แค่คืนบรรทัด THUMBNAIL;
-//  worker รองรับ type thumbnail อยู่แล้ว ไม่ต้องแก้ฝั่งนั้น)
+// media ที่ warm ได้:
+//   video    → /{mediaSlug}/video.m3u8
+//   audio    → /{mediaSlug}/audio.m3u8
+//   thumbnail sprite.vtt → /{fileSlug}/sprite/sprite.vtt
 const targetMediaFilter = {
     deletedAt: { $exists: false },
     $or: [
         { type: MediaType.VIDEO, resolution: { $in: PREWARM_RESOLUTIONS } },
-        // { type: MediaType.THUMBNAIL, fileName: "sprite.vtt" },
+        { type: MediaType.AUDIO },
+        { type: MediaType.THUMBNAIL, fileName: "sprite.vtt" },
     ],
 };
 
