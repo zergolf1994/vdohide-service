@@ -8,6 +8,7 @@ const workspaceSchema = new Schema(
     {
         _id: { type: String, required: true },
         creatorId: { type: String },
+        status: { type: String },
         metadata: {
             type: new Schema(
                 {

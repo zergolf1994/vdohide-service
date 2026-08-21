@@ -7,19 +7,35 @@ import {
     VIDEO_PROCESS_OPEN_STATUSES,
     WorkerType,
 } from "@/core/enums";
-import { FileModel, IngestModel, MediaModel, VideoProcessModel } from "@/db/models";
+import { FileModel, IngestModel, MediaModel, VideoProcessModel, WorkspaceModel } from "@/db/models";
 import { getWorkers } from "../worker/get-workers.service";
 import { getSettingsByNames } from "../setting/get-setting.service";
+import {
+    buildTranscodeFileFilter,
+    DEFAULT_TRANSCODE_FILE_SELECTION,
+    normalizeTranscodeFileSelection,
+    TranscodeFileSelection,
+} from "./transcode-file-filter";
+import {
+    buildTranscodeWorkspaceFilter,
+    DEFAULT_TRANSCODE_WORKSPACE_SELECTION,
+    normalizeTranscodeWorkspaceSelection,
+    TranscodeWorkspaceSelection,
+} from "./transcode-workspace-filter";
 
 interface TranscodeConfig {
     enabled: boolean;
     slotRate: number;
     gpuEnabled?: boolean; // worker อ่านเอง — เก็บใน setting เดียวกัน
+    workspaceSelection?: TranscodeWorkspaceSelection;
+    fileSelection?: TranscodeFileSelection;
 }
 
 const default_transcode_config: TranscodeConfig = {
     enabled: true,
     slotRate: 2,
+    workspaceSelection: DEFAULT_TRANSCODE_WORKSPACE_SELECTION,
+    fileSelection: DEFAULT_TRANSCODE_FILE_SELECTION,
 };
 
 // enqueuer: ไฟล์ ready ที่ยังไม่เคย transcode → เติมงาน transcode pending
@@ -42,6 +58,26 @@ export const getTranscodePending = async () => {
 
         if (!transcode_config.enabled) {
             return { message: "Transcode is disabled" };
+        }
+
+        const workspaceSelection = normalizeTranscodeWorkspaceSelection(
+            transcode_config.workspaceSelection
+        );
+        const legacySort = transcode_config.workspaceSelection
+            && typeof transcode_config.workspaceSelection === "object"
+            ? (transcode_config.workspaceSelection as unknown as Record<string, unknown>).sort
+            : undefined;
+        const fileSelection = normalizeTranscodeFileSelection(
+            transcode_config.fileSelection,
+            legacySort
+        );
+        let eligibleWorkspaceIds: string[] | null = null;
+        if (workspaceSelection.rules.length > 0) {
+            const workspaceFilter = buildTranscodeWorkspaceFilter(workspaceSelection);
+            eligibleWorkspaceIds = await WorkspaceModel.distinct("_id", workspaceFilter);
+            if (eligibleWorkspaceIds.length === 0) {
+                return { message: "No workspaces eligible for transcode" };
+            }
         }
 
         const workers = await getWorkers({ type: WorkerType.TRANSCODE });
@@ -88,15 +124,30 @@ export const getTranscodePending = async () => {
         ]);
         const excluded = [...new Set([...blockedFileIds, ...transcodedFileIds, ...pendingIngestFileIds])];
 
-        const files = await FileModel.find({
+        const baseFileFilter = {
             type: FileType.VIDEO,
             status: FileStatus.READY,
             clonedFrom: { $exists: false },
             "metadata.trashedAt": { $exists: false },
             "metadata.deletedAt": { $exists: false },
+            ...(eligibleWorkspaceIds ? { spaceId: { $in: eligibleWorkspaceIds } } : {}),
             ...(excluded.length > 0 ? { _id: { $nin: excluded } } : {}),
-        })
-            .sort({ createdAt: 1 })
+        };
+        const configuredFileFilter = buildTranscodeFileFilter(fileSelection);
+        const fileFilter = Object.keys(configuredFileFilter).length > 0
+            ? { $and: [baseFileFilter, configuredFileFilter] }
+            : baseFileFilter;
+        const fileSort = Object.fromEntries([
+            ...(fileSelection.sort.length > 0
+                ? fileSelection.sort.map((entry) => [
+                    entry.field === "size" ? "metadata.size" : "createdAt",
+                    entry.direction === "asc" ? 1 : -1,
+                ])
+                : [["createdAt", 1]]),
+            ["_id", 1],
+        ]);
+        const files = await FileModel.find(fileFilter)
+            .sort(fileSort)
             .limit(slots)
             .select({ _id: 1, spaceId: 1, slug: 1 })
             .lean();
