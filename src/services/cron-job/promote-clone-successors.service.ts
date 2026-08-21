@@ -106,88 +106,148 @@ export const promoteCloneSuccessors = async (
     return promoted;
 };
 
-const syncMissingCloneSprites = async () => {
-    const missing = await FileModel.aggregate([
-        {
-            $match: {
-                ...activeCloneFilter,
-                clonedFrom: { $exists: true, $nin: [null, ""] },
-            },
-        },
-        {
-            $lookup: {
-                from: "medias",
-                let: { cloneFileId: "$_id" },
-                pipeline: [
-                    {
-                        $match: {
-                            $expr: { $eq: ["$fileId", "$$cloneFileId"] },
-                            type: MediaType.THUMBNAIL,
-                            fileName: "sprite.vtt",
+const auxiliaryMediaFilter = {
+    $or: [
+        { type: MediaType.AUDIO },
+        { type: MediaType.SUBTITLE },
+        { type: MediaType.THUMBNAIL, fileName: "sprite.vtt" },
+    ],
+};
+
+const mediaIdentity = (media: any) => {
+    const fileName = typeof media.fileName === "string" ? media.fileName : "";
+    const sourceIndex = media.metadata?.sourceIndex ?? "";
+    return `${media.type}:${fileName}:${sourceIndex}`;
+};
+
+let cloneRepairCursor: string | null = null;
+
+// Synchronize separated audio/subtitle tracks and sprite.vtt across a clone
+// group. The canonical/original File is always preferred as the source. A
+// surviving clone is used only for legacy groups whose original was removed.
+const syncMissingCloneAuxiliaryMedia = async () => {
+    const clones = await FileModel.find({
+        ...activeCloneFilter,
+        clonedFrom: { $exists: true, $nin: [null, ""] },
+        ...(cloneRepairCursor ? { _id: { $gt: cloneRepairCursor } } : {}),
+    })
+        .sort({ _id: 1 })
+        .select({ _id: 1, clonedFrom: 1 })
+        .limit(500)
+        .lean();
+
+    if (clones.length === 0) {
+        cloneRepairCursor = null;
+        return 0;
+    }
+    cloneRepairCursor = clones.length < 500
+        ? null
+        : String((clones[clones.length - 1] as any)._id);
+
+    const sourceIds = [...new Set((clones as any[]).map((file) => String(file.clonedFrom)))];
+    const existingSources = await FileModel.find({
+        _id: { $in: sourceIds },
+        ...activeCloneFilter,
+    })
+        .select({ _id: 1 })
+        .lean();
+    const existingSourceIds = new Set((existingSources as any[]).map((file) => String(file._id)));
+    const cloneIds = (clones as any[]).map((file) => String(file._id));
+    const groupFileIds = [...new Set([...sourceIds, ...cloneIds])];
+
+    const medias = await MediaModel.find({
+        fileId: { $in: groupFileIds },
+        deletedAt: { $exists: false },
+        ...auxiliaryMediaFilter,
+    }).lean();
+
+    const mediaByFile = new Map<string, any[]>();
+    for (const media of medias as any[]) {
+        const fileId = String(media.fileId);
+        const list = mediaByFile.get(fileId) ?? [];
+        list.push(media);
+        mediaByFile.set(fileId, list);
+    }
+
+    const clonesBySource = new Map<string, any[]>();
+    for (const clone of clones as any[]) {
+        const sourceId = String(clone.clonedFrom);
+        const list = clonesBySource.get(sourceId) ?? [];
+        list.push(clone);
+        clonesBySource.set(sourceId, list);
+    }
+
+    const operations: any[] = [];
+    const operationKeys = new Set<string>();
+
+    for (const [sourceId, members] of clonesBySource) {
+        // Canonical media wins. Members only fill gaps in legacy groups.
+        const desiredByIdentity = new Map<string, any>();
+        for (const media of mediaByFile.get(sourceId) ?? []) {
+            desiredByIdentity.set(mediaIdentity(media), media);
+        }
+        for (const member of members) {
+            for (const media of mediaByFile.get(String(member._id)) ?? []) {
+                const identity = mediaIdentity(media);
+                if (!desiredByIdentity.has(identity)) desiredByIdentity.set(identity, media);
+            }
+        }
+
+        if (desiredByIdentity.size === 0) continue;
+
+        const targetIds = members.map((member) => String(member._id));
+        if (existingSourceIds.has(sourceId)) targetIds.unshift(sourceId);
+
+        for (const targetId of targetIds) {
+            const existing = new Set(
+                (mediaByFile.get(targetId) ?? []).map(mediaIdentity),
+            );
+
+            for (const [identity, source] of desiredByIdentity) {
+                if (existing.has(identity)) continue;
+                const operationKey = `${targetId}:${identity}`;
+                if (operationKeys.has(operationKey)) continue;
+                operationKeys.add(operationKey);
+
+                const identityFilter = source.fileName
+                    ? { fileName: source.fileName }
+                    : { "metadata.sourceIndex": source.metadata?.sourceIndex };
+
+                operations.push({
+                    updateOne: {
+                        filter: {
+                            fileId: targetId,
+                            type: source.type,
+                            ...identityFilter,
                             deletedAt: { $exists: false },
                         },
+                        update: {
+                            $setOnInsert: {
+                                type: source.type,
+                                fileName: source.fileName,
+                                mimeType: source.mimeType,
+                                resolution: source.resolution,
+                                storageId: source.storageId,
+                                path: source.path,
+                                sourceHash: source.sourceHash,
+                                fileId: targetId,
+                                clonedFrom: source.clonedFrom || String(source.fileId),
+                                metadata: source.metadata,
+                            },
+                        },
+                        upsert: true,
                     },
-                    { $limit: 1 },
-                ],
-                as: "_sprite",
-            },
-        },
-        { $match: { "_sprite.0": { $exists: false } } },
-        { $project: { _id: 1, clonedFrom: 1 } },
-        { $limit: 500 },
-    ]);
-
-    if (missing.length === 0) return 0;
-
-    const sourceIds = [...new Set(missing.map((file: any) => String(file.clonedFrom)))];
-    const sourceSprites = await MediaModel.find({
-        fileId: { $in: sourceIds },
-        type: MediaType.THUMBNAIL,
-        fileName: "sprite.vtt",
-        deletedAt: { $exists: false },
-    }).lean();
-    const spriteBySource = new Map(
-        (sourceSprites as any[]).map((media) => [String(media.fileId), media]),
-    );
-
-    const operations = (missing as any[]).flatMap((clone) => {
-        const sourceFileId = String(clone.clonedFrom);
-        const source = spriteBySource.get(sourceFileId);
-        if (!source) return []; // source ยังไม่สร้าง sprite — worker จะกระจายให้ภายหลัง
-
-        return [{
-            updateOne: {
-                filter: {
-                    fileId: String(clone._id),
-                    type: MediaType.THUMBNAIL,
-                    fileName: "sprite.vtt",
-                    deletedAt: { $exists: false },
-                },
-                update: {
-                    $setOnInsert: {
-                        type: MediaType.THUMBNAIL,
-                        fileName: source.fileName,
-                        mimeType: source.mimeType,
-                        storageId: source.storageId,
-                        path: source.path,
-                        sourceHash: source.sourceHash,
-                        fileId: String(clone._id),
-                        clonedFrom: source.clonedFrom || sourceFileId,
-                        metadata: source.metadata,
-                    },
-                },
-                upsert: true,
-            },
-        }];
-    });
+                });
+            }
+        }
+    }
 
     if (operations.length === 0) return 0;
 
     const result = await MediaModel.bulkWrite(operations, { ordered: false });
     const synced = result.upsertedCount;
-
     if (synced > 0) {
-        console.log(`[repair:clone-sprites] synced ${synced} missing sprite media record(s)`);
+        console.log(`[repair:clone-media] synced ${synced} missing audio/subtitle/sprite media record(s)`);
     }
     return synced;
 };
@@ -212,10 +272,10 @@ export const repairOrphanedCloneGroups = async () => {
         orphaned = roots.map(String).filter((id) => !existingIds.has(id)).slice(0, 100);
         promoted = await promoteCloneSuccessors(orphaned);
     }
-    const syncedSprites = await syncMissingCloneSprites();
+    const syncedMedia = await syncMissingCloneAuxiliaryMedia();
 
     return {
-        message: promoted > 0 || syncedSprites > 0 ? "Success" : "No clone repairs needed",
-        data: { scanned: orphaned.length, promoted, syncedSprites },
+        message: promoted > 0 || syncedMedia > 0 ? "Success" : "No clone repairs needed",
+        data: { scanned: orphaned.length, promoted, syncedMedia },
     };
 };
