@@ -49,6 +49,12 @@ const ingestSchema = new Schema(
         purpose: { type: String },
         // path บน UI ปลายทาง — ส่งกลับเป็น `page` ให้ client นำทางหลังอัพเสร็จ
         relativePath: { type: String },
+        multipart: {
+            uploadId: { type: String },
+            partSize: { type: Number },
+            initiatedAt: { type: Date },
+            completedAt: { type: Date },
+        },
         deletedAt: { type: Date }
     },
     {
@@ -59,6 +65,7 @@ const ingestSchema = new Schema(
 );
 
 ingestSchema.index({ fileId: 1, status: 1 });
+ingestSchema.index({ status: 1, updatedAt: 1 });
 ingestSchema.index({ deletedAt: 1 });
 ingestSchema.index(
     { migrationId: 1, sourceMediaId: 1 },

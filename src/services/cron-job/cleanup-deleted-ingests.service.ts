@@ -1,11 +1,12 @@
-import { S3Client } from "@aws-sdk/client-s3";
-import { StorageType } from "@/core/enums";
+import { AbortMultipartUploadCommand, S3Client } from "@aws-sdk/client-s3";
+import { IngestStatus, StorageType } from "@/core/enums";
 import { IngestModel, StorageModel } from "@/db/models";
 import { applyPrefix, deleteVersions, listAllVersions, s3ClientFor } from "./s3-cleanup.helper";
 
 // One migration creates one deleted ingest per media. Process enough objects
 // per pass to keep up with a drain while bounding S3 list/delete requests.
 const BATCH_SIZE = 100;
+const STALE_UPLOAD_AGE_MS = 24 * 60 * 60 * 1000;
 
 // key เดียวกับฝั่ง Go worker: ingest.path เป็น source of truth
 // (fallback {fileId}/{fileName} สำหรับ doc เก่า) + เติม s3.prefix ถ้ายังไม่มี
@@ -24,7 +25,13 @@ const baseKeyFor = (ingest: any, prefix: string): string =>
 // จะเสีย pointer แล้ว object ค้างบน S3 ตลอดไป)
 export const cleanupDeletedIngests = async () => {
     try {
-        const ingests = await IngestModel.find({ deletedAt: { $exists: true } })
+        const staleBefore = new Date(Date.now() - STALE_UPLOAD_AGE_MS);
+        const ingests = await IngestModel.find({
+            $or: [
+                { deletedAt: { $exists: true } },
+                { status: IngestStatus.UPLOADING, updatedAt: { $lt: staleBefore } },
+            ],
+        })
             .sort({ deletedAt: 1 })
             .limit(BATCH_SIZE)
             .lean();
@@ -80,6 +87,20 @@ export const cleanupDeletedIngests = async () => {
                         failed++;
                         console.error(`[cleanup:ingests] ${ingest._id}: empty object key — skipped`);
                         continue;
+                    }
+
+                    if (ingest.multipart?.uploadId && !ingest.multipart.completedAt) {
+                        try {
+                            await client.send(new AbortMultipartUploadCommand({
+                                Bucket: storage.s3.bucket,
+                                Key: base,
+                                UploadId: ingest.multipart.uploadId,
+                            }));
+                            console.log(`[cleanup:ingests] aborted stale multipart upload ${ingest.multipart.uploadId} for s3://${storage.s3.bucket}/${base}`);
+                        } catch (error: any) {
+                            // client อาจ abort ไปแล้วก่อน soft-delete ingest
+                            if (error?.name !== "NoSuchUpload") throw error;
+                        }
                     }
 
                     // ทุก version + delete marker → ลบระบุ VersionId (หายถาวรจริง ไม่เหลือ hidden)
