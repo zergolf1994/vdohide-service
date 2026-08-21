@@ -138,7 +138,7 @@ const syncMissingCloneAuxiliaryMedia = async () => {
 
     if (clones.length === 0) {
         cloneRepairCursor = null;
-        return 0;
+        return { syncedFiles: 0, syncedMedia: 0 };
     }
     cloneRepairCursor = clones.length < 500
         ? null
@@ -149,9 +149,18 @@ const syncMissingCloneAuxiliaryMedia = async () => {
         _id: { $in: sourceIds },
         ...activeCloneFilter,
     })
-        .select({ _id: 1 })
+        .select({
+            _id: 1,
+            "metadata.highest": 1,
+            "metadata.mediaLayout": 1,
+            "metadata.audioTrackCount": 1,
+            "metadata.subtitleTrackCount": 1,
+        })
         .lean();
     const existingSourceIds = new Set((existingSources as any[]).map((file) => String(file._id)));
+    const sourceById = new Map(
+        (existingSources as any[]).map((file) => [String(file._id), file]),
+    );
     const cloneIds = (clones as any[]).map((file) => String(file._id));
     const groupFileIds = [...new Set([...sourceIds, ...cloneIds])];
 
@@ -178,6 +187,7 @@ const syncMissingCloneAuxiliaryMedia = async () => {
     }
 
     const operations: any[] = [];
+    const fileOperations: any[] = [];
     const operationKeys = new Set<string>();
 
     for (const [sourceId, members] of clonesBySource) {
@@ -190,6 +200,45 @@ const syncMissingCloneAuxiliaryMedia = async () => {
             for (const media of mediaByFile.get(String(member._id)) ?? []) {
                 const identity = mediaIdentity(media);
                 if (!desiredByIdentity.has(identity)) desiredByIdentity.set(identity, media);
+            }
+        }
+
+        const sourceMetadata = sourceById.get(sourceId)?.metadata;
+        if (sourceMetadata) {
+            const audioCount = [...desiredByIdentity.values()]
+                .filter((media) => media.type === MediaType.AUDIO).length;
+            const subtitleCount = [...desiredByIdentity.values()]
+                .filter((media) => media.type === MediaType.SUBTITLE).length;
+            const metadataSet: Record<string, unknown> = {};
+
+            if (sourceMetadata.highest !== undefined) {
+                metadataSet["metadata.highest"] = sourceMetadata.highest;
+            }
+            if (sourceMetadata.mediaLayout !== undefined || audioCount > 0) {
+                metadataSet["metadata.mediaLayout"] = sourceMetadata.mediaLayout ?? "separated";
+            }
+            if (sourceMetadata.audioTrackCount !== undefined || audioCount > 0) {
+                metadataSet["metadata.audioTrackCount"] = sourceMetadata.audioTrackCount ?? audioCount;
+            }
+            if (sourceMetadata.subtitleTrackCount !== undefined || subtitleCount > 0) {
+                metadataSet["metadata.subtitleTrackCount"] = sourceMetadata.subtitleTrackCount ?? subtitleCount;
+            }
+
+            const metadataEntries = Object.entries(metadataSet);
+            if (metadataEntries.length > 0) {
+                fileOperations.push({
+                    updateMany: {
+                        filter: {
+                            _id: { $in: members.map((member) => String(member._id)) },
+                            $or: metadataEntries.map(([field, value]) => ({
+                                [field]: { $ne: value },
+                            })),
+                        },
+                        update: {
+                            $set: { ...metadataSet, updatedAt: new Date() },
+                        },
+                    },
+                });
             }
         }
 
@@ -242,14 +291,23 @@ const syncMissingCloneAuxiliaryMedia = async () => {
         }
     }
 
-    if (operations.length === 0) return 0;
+    let syncedFiles = 0;
+    let syncedMedia = 0;
 
-    const result = await MediaModel.bulkWrite(operations, { ordered: false });
-    const synced = result.upsertedCount;
-    if (synced > 0) {
-        console.log(`[repair:clone-media] synced ${synced} missing audio/subtitle/sprite media record(s)`);
+    if (fileOperations.length > 0) {
+        const fileResult = await FileModel.bulkWrite(fileOperations, { ordered: false });
+        syncedFiles = fileResult.modifiedCount;
     }
-    return synced;
+
+    if (operations.length > 0) {
+        const mediaResult = await MediaModel.bulkWrite(operations, { ordered: false });
+        syncedMedia = mediaResult.upsertedCount;
+    }
+
+    if (syncedFiles > 0 || syncedMedia > 0) {
+        console.log(`[repair:clone-media] synced ${syncedFiles} file metadata and ${syncedMedia} missing audio/subtitle/sprite media record(s)`);
+    }
+    return { syncedFiles, syncedMedia };
 };
 
 // Repairs legacy groups where the source File document was already removed.
@@ -272,10 +330,12 @@ export const repairOrphanedCloneGroups = async () => {
         orphaned = roots.map(String).filter((id) => !existingIds.has(id)).slice(0, 100);
         promoted = await promoteCloneSuccessors(orphaned);
     }
-    const syncedMedia = await syncMissingCloneAuxiliaryMedia();
+    const { syncedFiles, syncedMedia } = await syncMissingCloneAuxiliaryMedia();
 
     return {
-        message: promoted > 0 || syncedMedia > 0 ? "Success" : "No clone repairs needed",
-        data: { scanned: orphaned.length, promoted, syncedMedia },
+        message: promoted > 0 || syncedFiles > 0 || syncedMedia > 0
+            ? "Success"
+            : "No clone repairs needed",
+        data: { scanned: orphaned.length, promoted, syncedFiles, syncedMedia },
     };
 };
