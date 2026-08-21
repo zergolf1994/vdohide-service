@@ -11,6 +11,7 @@ export enum VideoProcessStatus {
 export enum TransferMode {
     INSTALL = "install",
     EVACUATE = "evacuate",
+    RESTORE = "restore",
     CLEANUP = "cleanup",
 }
 

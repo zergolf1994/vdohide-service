@@ -10,11 +10,12 @@ import {
     WorkerType,
 } from "@/core/enums";
 import { FileModel, IngestModel, MediaModel, StorageModel, VideoProcessModel } from "@/db/models";
-import { getPermanentS3Storages, getTempStorages } from "../storage/get-storage.service";
+import { getLocalStorages, getPermanentS3Storages, getTempStorages } from "../storage/get-storage.service";
 import { getWorkers } from "../worker/get-workers.service";
 
 type DrainStorage = {
     _id: string;
+    type: StorageType;
     drainState: StorageDrainState;
     drainTempStorageId?: string;
     drainRequestedAt?: Date;
@@ -28,10 +29,94 @@ const timelineFor = (mode: TransferMode) => {
             ingest: { status: "pending" },
         };
     }
+    if (mode === TransferMode.RESTORE) {
+        return {
+            download: { status: "pending" },
+            install: { status: "pending" },
+            media: { status: "pending" },
+        };
+    }
     return {
         verify: { status: "pending" },
         cleanup: { status: "pending" },
     };
+};
+
+const enqueueRestore = async (
+    storage: DrainStorage,
+    destinations: Array<{ _id: string; slots: number }>,
+) => {
+    const totalSlots = destinations.reduce((total, item) => total + item.slots, 0);
+    if (totalSlots <= 0) return 0;
+
+    const blockedFileIds = await VideoProcessModel.distinct("fileId", {
+        processType: WorkerType.TRANSFER,
+        sourceStorageId: storage._id,
+        status: {
+            $in: [...VIDEO_PROCESS_OPEN_STATUSES, VideoProcessStatus.FAILED, VideoProcessStatus.CANCELLED],
+        },
+    });
+    const medias = await MediaModel.find({
+        storageId: storage._id,
+        fileId: {
+            $exists: true,
+            ...(blockedFileIds.length > 0 ? { $nin: blockedFileIds.map(String) } : {}),
+        },
+        clonedFrom: { $exists: false },
+        deletedAt: { $exists: false },
+        type: { $in: [MediaType.VIDEO, MediaType.THUMBNAIL, MediaType.AUDIO, MediaType.SUBTITLE] },
+    })
+        .sort({ createdAt: 1, _id: 1 })
+        .limit(totalSlots * 10)
+        .lean();
+    if (medias.length === 0) return 0;
+
+    const fileIds = [...new Set(medias.map((media) => String(media.fileId)))];
+    const files = await FileModel.find({ _id: { $in: fileIds } }, { spaceId: 1, slug: 1 }).lean();
+    const fileMap = new Map(files.map((file) => [String(file._id), file]));
+    const requestedAt = storage.drainRequestedAt?.getTime() ?? 0;
+    const remaining = new Map(destinations.map((item) => [item._id, item.slots]));
+    const docs: Record<string, unknown>[] = [];
+    const scheduledFileIds = new Set<string>();
+
+    for (const media of medias) {
+        const target = destinations.find((item) => (remaining.get(item._id) ?? 0) > 0);
+        if (!target) break;
+        const fileId = String(media.fileId);
+        if (scheduledFileIds.has(fileId)) continue;
+        const file = fileMap.get(fileId);
+        if (!file) continue;
+        docs.push({
+            fileId,
+            spaceId: file.spaceId,
+            slug: file.slug,
+            processType: WorkerType.TRANSFER,
+            transferMode: TransferMode.RESTORE,
+            status: VideoProcessStatus.PENDING,
+            sourceStorageId: storage._id,
+            targetStorageId: target._id,
+            migrationId: `${storage._id}:${requestedAt}:${media._id}`,
+            sourceMediaIds: [String(media._id)],
+            resolution: media.resolution,
+            file_name: media.fileName,
+            timeline: timelineFor(TransferMode.RESTORE),
+        });
+        scheduledFileIds.add(fileId);
+        remaining.set(target._id, (remaining.get(target._id) ?? 1) - 1);
+    }
+    if (docs.length === 0) return 0;
+
+    const stillScheduling = await StorageModel.exists({
+        _id: storage._id,
+        drainState: { $in: [StorageDrainState.REQUESTED, StorageDrainState.DRAINING, StorageDrainState.BLOCKED] },
+    });
+    if (!stillScheduling) return 0;
+    try {
+        return (await VideoProcessModel.insertMany(docs, { ordered: false })).length;
+    } catch (error: any) {
+        if (error?.code !== 11000 && error?.writeErrors === undefined) throw error;
+        return error?.insertedDocs?.length ?? 0;
+    }
 };
 
 const enqueueEvacuate = async (
@@ -201,7 +286,7 @@ const finishCancellingDrain = async (storage: DrainStorage, sourceSlots: number)
 export const getStorageDrainPending = async () => {
     try {
         const storages = (await StorageModel.find({
-            type: StorageType.LOCAL,
+            type: { $in: [StorageType.LOCAL, StorageType.S3] },
             status: StorageStatus.ONLINE,
             drainState: {
                 $in: [
@@ -215,10 +300,11 @@ export const getStorageDrainPending = async () => {
 
         if (storages.length === 0) return { message: "No storage drain requested", data: { enqueued: 0 } };
 
-        const [workers, tempStorages, permanentS3Storages] = await Promise.all([
+        const [workers, tempStorages, permanentS3Storages, localStorages] = await Promise.all([
             getWorkers({ type: WorkerType.TRANSFER }),
             getTempStorages(),
             getPermanentS3Storages(),
+            getLocalStorages(95),
         ]);
         const workerSlots = new Map<string, number>();
         for (const worker of workers.data as any[]) {
@@ -232,7 +318,7 @@ export const getStorageDrainPending = async () => {
         let enqueued = 0;
         for (const storage of storages) {
             const sourceSlots = workerSlots.get(String(storage._id)) ?? 0;
-            if (storage.drainState === StorageDrainState.CANCELLING) {
+            if (storage.type === StorageType.LOCAL && storage.drainState === StorageDrainState.CANCELLING) {
                 enqueued += await finishCancellingDrain(storage, sourceSlots);
                 continue;
             }
@@ -241,7 +327,7 @@ export const getStorageDrainPending = async () => {
                 storageId: storage._id,
                 clonedFrom: { $exists: false },
                 deletedAt: { $exists: false },
-                type: { $nin: [MediaType.VIDEO, MediaType.THUMBNAIL] },
+                type: { $nin: [MediaType.VIDEO, MediaType.THUMBNAIL, MediaType.AUDIO, MediaType.SUBTITLE] },
             });
             if (unsupportedCount > 0) {
                 await StorageModel.updateOne(
@@ -252,10 +338,97 @@ export const getStorageDrainPending = async () => {
                     {
                         $set: {
                             drainState: StorageDrainState.BLOCKED,
-                            drainError: `${unsupportedCount} non-video media record(s) require a different migration worker`,
+                            drainError: `${unsupportedCount} unsupported media record(s) require a different migration worker`,
                         },
                     },
                 );
+                continue;
+            }
+            if (storage.type === StorageType.S3) {
+                const destinations: Array<{ _id: string; slots: number }> = [];
+                for (const target of localStorages.data as any[]) {
+                    const targetId = String(target._id);
+                    const capacity = workerSlots.get(targetId) ?? 0;
+                    if (capacity <= 0) continue;
+                    const openJobs = await VideoProcessModel.countDocuments({
+                        processType: WorkerType.TRANSFER,
+                        targetStorageId: targetId,
+                        status: { $in: VIDEO_PROCESS_OPEN_STATUSES },
+                    });
+                    const slots = Math.max(0, capacity - openJobs);
+                    if (slots > 0) destinations.push({ _id: targetId, slots });
+                }
+
+                if (storage.drainState === StorageDrainState.CANCELLING) {
+                    enqueued += await finishCancellingDrain(
+                        storage,
+                        destinations.reduce((total, item) => total + item.slots, 0),
+                    );
+                    continue;
+                }
+
+                if (destinations.length > 0) {
+                    enqueued += await enqueueRestore(storage, destinations);
+                }
+
+                const [remainingMedia, openJobs, failedJobs, pendingDeletion] = await Promise.all([
+                    MediaModel.countDocuments({
+                        storageId: storage._id,
+                        clonedFrom: { $exists: false },
+                        deletedAt: { $exists: false },
+                    }),
+                    VideoProcessModel.countDocuments({
+                        processType: WorkerType.TRANSFER,
+                        sourceStorageId: storage._id,
+                        status: { $in: VIDEO_PROCESS_OPEN_STATUSES },
+                    }),
+                    VideoProcessModel.countDocuments({
+                        processType: WorkerType.TRANSFER,
+                        sourceStorageId: storage._id,
+                        status: { $in: [VideoProcessStatus.FAILED, VideoProcessStatus.CANCELLED] },
+                    }),
+                    MediaModel.countDocuments({
+                        storageId: storage._id,
+                        deletedAt: { $exists: true, $ne: null },
+                    }),
+                ]);
+
+                if (remainingMedia === 0 && openJobs === 0 && failedJobs === 0 && pendingDeletion === 0) {
+                    await StorageModel.updateOne(
+                        { _id: storage._id, drainState: { $ne: StorageDrainState.CANCELLING } },
+                        {
+                            $set: {
+                                drainState: StorageDrainState.COMPLETED,
+                                drainCompletedAt: new Date(),
+                                status: StorageStatus.OFFLINE,
+                            },
+                            $unset: { drainError: "", drainTempStorageId: "" },
+                        },
+                    );
+                } else if (failedJobs > 0) {
+                    await StorageModel.updateOne(
+                        { _id: storage._id, drainState: { $ne: StorageDrainState.CANCELLING } },
+                        { $set: { drainState: StorageDrainState.BLOCKED, drainError: `${failedJobs} migration job(s) need attention` } },
+                    );
+                } else if (destinations.length === 0 && openJobs === 0) {
+                    await StorageModel.updateOne(
+                        { _id: storage._id, drainState: { $ne: StorageDrainState.CANCELLING } },
+                        {
+                            $set: {
+                                drainState: StorageDrainState.BLOCKED,
+                                drainError: "No Local storage below 95% with an available transfer worker",
+                            },
+                        },
+                    );
+                } else {
+                    await StorageModel.updateOne(
+                        { _id: storage._id, drainState: { $ne: StorageDrainState.CANCELLING } },
+                        {
+                            $set: { drainState: StorageDrainState.DRAINING },
+                            $unset: { drainError: "", drainTempStorageId: "" },
+                        },
+                    );
+                }
                 continue;
             }
             if (sourceSlots <= 0) {
