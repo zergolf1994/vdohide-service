@@ -1,22 +1,38 @@
 import { VideoProcessStatus, VIDEO_PROCESS_OPEN_STATUSES, WorkerType } from "@/core/enums";
-import { VideoProcessModel } from "@/db/models";
+import { VideoProcessModel, WorkspaceModel } from "@/db/models";
 import { getTempStorages } from "../storage/get-storage.service";
 import { getWorkers } from "../worker/get-workers.service";
 import { getFilesNeededDownload } from "../file";
 import { getSettingsByNames } from "../setting/get-setting.service";
+import {
+    buildTranscodeFileFilter,
+    DEFAULT_TRANSCODE_FILE_SELECTION,
+    normalizeTranscodeFileSelection,
+    TranscodeFileSelection,
+} from "./transcode-file-filter";
+import {
+    buildTranscodeWorkspaceFilter,
+    DEFAULT_TRANSCODE_WORKSPACE_SELECTION,
+    normalizeTranscodeWorkspaceSelection,
+    TranscodeWorkspaceSelection,
+} from "./transcode-workspace-filter";
 
 interface DownloadConfig {
     enabled: boolean;
-    sort: { [key: string]: 1 | -1 };
-    filter: Record<string, any>;
+    sort?: { [key: string]: 1 | -1 };
+    filter?: Record<string, any>;
     slotRate: number;
+    workspaceSelection?: TranscodeWorkspaceSelection;
+    fileSelection?: TranscodeFileSelection;
 }
 
 const default_download_config: DownloadConfig = {
     enabled: true,
     sort: { createdAt: -1 },
     filter: {},
-    slotRate: 2
+    slotRate: 2,
+    workspaceSelection: DEFAULT_TRANSCODE_WORKSPACE_SELECTION,
+    fileSelection: DEFAULT_TRANSCODE_FILE_SELECTION,
 };
 
 // enqueuer: หา slot ว่าง → หาไฟล์ waiting ที่ยังไม่อยู่ในคิว → เติมเป็น pending
@@ -26,13 +42,32 @@ export const getDownloadOriginal = async () => {
         // merge รายฟิลด์ — doc ใน DB อาจมีแค่บาง field (เช่นของเก่าไม่มี slotRate)
         // ถ้าใช้ default เฉพาะตอน doc หายทั้งก้อน field ที่ขาดจะเป็น undefined → capacity เป็น NaN
         const settings = await getSettingsByNames(["download_config"])
+        const storedConfig = settings.download_config && typeof settings.download_config === "object"
+            ? settings.download_config as Record<string, unknown>
+            : {};
         const download_config: DownloadConfig = {
             ...default_download_config,
-            ...(settings.download_config ?? {}),
+            ...storedConfig,
         };
 
         if (!download_config.enabled) {
             return { message: "Download is disabled" }
+        }
+
+        const workspaceSelection = normalizeTranscodeWorkspaceSelection(
+            download_config.workspaceSelection
+        );
+        const hasFileSelection = Object.prototype.hasOwnProperty.call(storedConfig, "fileSelection");
+        const fileSelection = normalizeTranscodeFileSelection(download_config.fileSelection);
+        let eligibleWorkspaceIds: string[] | null = null;
+        if (workspaceSelection.rules.length > 0) {
+            eligibleWorkspaceIds = await WorkspaceModel.distinct(
+                "_id",
+                buildTranscodeWorkspaceFilter(workspaceSelection)
+            );
+            if (eligibleWorkspaceIds.length === 0) {
+                return { message: "No workspaces eligible for download" };
+            }
         }
 
         const [storages, workers] = await Promise.all([
@@ -55,10 +90,31 @@ export const getDownloadOriginal = async () => {
             return { message: "Queue is full", data: { capacity, openCount } }
         }
 
+        const filters: Record<string, unknown>[] = [];
+        if (eligibleWorkspaceIds) filters.push({ spaceId: { $in: eligibleWorkspaceIds } });
+        if (hasFileSelection) {
+            const configuredFilter = buildTranscodeFileFilter(fileSelection);
+            if (Object.keys(configuredFilter).length > 0) filters.push(configuredFilter);
+        } else if (download_config.filter && Object.keys(download_config.filter).length > 0) {
+            filters.push(download_config.filter);
+        }
+        const filter = filters.length > 1 ? { $and: filters } : filters[0] ?? {};
+        const sort = hasFileSelection
+            ? Object.fromEntries([
+                ...(fileSelection.sort.length > 0
+                    ? fileSelection.sort.map((entry) => [
+                        entry.field === "size" ? "metadata.size" : "createdAt",
+                        entry.direction === "asc" ? 1 : -1,
+                    ])
+                    : [["createdAt", -1]]),
+                ["_id", 1],
+            ])
+            : download_config.sort ?? { createdAt: -1 };
+
         const files = await getFilesNeededDownload({
             limit: slots,
-            sort: download_config.sort,
-            filter: download_config.filter
+            sort,
+            filter
         });
 
         if (files.data.length === 0) {
