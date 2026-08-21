@@ -1,110 +1,150 @@
 import { MediaType, Resolution } from "@/core/enums";
-import { MediaModel } from "@/db/models";
+import { FileModel, MediaModel } from "@/db/models";
 
-// An original is disposable when the same File has an active video rendition
-// whose resolution exactly matches files.metadata.highest. This deliberately
-// derives truth from File + Media records and does not depend on short-lived
-// video_process/video_process_history documents.
-
+// ตรวจ Original เป็นชุดแบบมี cursor แทน aggregation ที่ lookup ทุก Original
+// ก่อนค่อย limit ซึ่งจะช้าลงเรื่อย ๆ เมื่อไฟล์ที่ยังแปลงไม่เสร็จสะสมมากขึ้น
 const NORMAL_BATCH = 2000;
 const FULL_BATCH = 2000;
+const TRANSCODED_RESOLUTIONS = new Set<string>([
+    Resolution.R1080,
+    Resolution.R720,
+    Resolution.R480,
+    Resolution.R360,
+]);
 
-interface EligibleOriginal {
+interface OriginalCandidate {
     _id: string;
     fileId: string;
-    highest: string;
 }
 
-const findEligibleOriginals = async (limit: number, afterId = "") => {
-    const originalMatch: Record<string, unknown> = {
+interface PurgeResult {
+    scanned: number;
+    candidates: number;
+    softDeleted: number;
+    lastScannedId: string;
+}
+
+// cursor ของ cron ปกติอยู่ใน process เดียวกัน โดย runEnqueuer ป้องกันการรันซ้อน
+// เมื่อเดินถึงท้าย collection จะวนกลับต้นใหม่ เพื่อให้ Original ที่เพิ่งมี
+// rendition ครบหลังจากถูกตรวจไปแล้วกลับมาถูกตรวจในรอบ sweep ถัดไป
+let normalCursor = "";
+
+const findOriginalBatch = async (limit: number, afterId = "") => {
+    const filter: Record<string, unknown> = {
         type: MediaType.VIDEO,
         resolution: Resolution.ORIGINAL,
         deletedAt: { $exists: false },
         fileId: { $type: "string" },
     };
-    if (afterId) originalMatch._id = { $gt: afterId };
+    if (afterId) filter._id = { $gt: afterId };
 
-    return MediaModel.aggregate<EligibleOriginal>([
-        { $match: originalMatch },
-        { $sort: { _id: 1 } },
-        {
-            $lookup: {
-                from: "files",
-                localField: "fileId",
-                foreignField: "_id",
-                pipeline: [
-                    { $match: { "metadata.highest": { $exists: true, $gt: 0 } } },
-                    { $project: { _id: 0, highest: { $toString: "$metadata.highest" } } },
-                ],
-                as: "file",
-            },
-        },
-        { $unwind: "$file" },
-        {
-            $lookup: {
-                from: "medias",
-                let: { fileId: "$fileId", highest: "$file.highest" },
-                pipeline: [
-                    {
-                        $match: {
-                            type: MediaType.VIDEO,
-                            deletedAt: { $exists: false },
-                            $expr: {
-                                $and: [
-                                    { $eq: ["$fileId", "$$fileId"] },
-                                    { $eq: ["$resolution", "$$highest"] },
-                                ],
-                            },
-                        },
-                    },
-                    { $limit: 1 },
-                    { $project: { _id: 1 } },
-                ],
-                as: "highestMedia",
-            },
-        },
-        { $match: { "highestMedia.0": { $exists: true } } },
-        { $project: { _id: 1, fileId: 1, highest: "$file.highest" } },
-        { $limit: limit },
-    ]).allowDiskUse(true);
+    return MediaModel.find(filter)
+        .sort({ _id: 1 })
+        .limit(limit)
+        .select({ _id: 1, fileId: 1 })
+        .lean<OriginalCandidate[]>();
 };
 
-const purgeEligibleOriginals = async (limit: number, afterId = "") => {
-    const originals = await findEligibleOriginals(limit, afterId);
-    if (originals.length === 0) {
-        return { candidates: 0, softDeleted: 0, lastId: "" };
+const findEligibleOriginalIds = async (originals: OriginalCandidate[]) => {
+    if (originals.length === 0) return [];
+
+    const fileIds = [...new Set(originals.map((media) => media.fileId))];
+    const files = await FileModel.find({
+        _id: { $in: fileIds },
+        "metadata.highest": { $exists: true, $gt: 0 },
+    })
+        .select({ _id: 1, "metadata.highest": 1 })
+        .lean();
+
+    // แบ่งตาม resolution เพื่อให้แต่ละ query ใช้ index
+    // {fileId, resolution, type, deletedAt} ได้ตรง ๆ โดยไม่ต้องใช้ $expr/$lookup
+    const fileIdsByHighest = new Map<string, string[]>();
+    for (const file of files) {
+        const highest = String(file.metadata?.highest ?? "");
+        if (!TRANSCODED_RESOLUTIONS.has(highest)) continue;
+        fileIdsByHighest.set(highest, [
+            ...(fileIdsByHighest.get(highest) ?? []),
+            String(file._id),
+        ]);
     }
 
-    const originalIds = originals.map((media) => media._id);
-    const result = await MediaModel.updateMany(
-        {
-            _id: { $in: originalIds },
-            type: MediaType.VIDEO,
-            resolution: Resolution.ORIGINAL,
-            deletedAt: { $exists: false },
-        },
-        { $set: { deletedAt: new Date() } }
+    const playableFileIds = new Set<string>();
+    await Promise.all(
+        [...fileIdsByHighest.entries()].map(async ([resolution, ids]) => {
+            const matchedIds = await MediaModel.distinct("fileId", {
+                fileId: { $in: ids },
+                type: MediaType.VIDEO,
+                resolution,
+                deletedAt: { $exists: false },
+            });
+            for (const fileId of matchedIds) playableFileIds.add(String(fileId));
+        })
     );
 
-    console.log(
-        `[cleanup:originals] soft-deleted ${result.modifiedCount} original media ` +
-        `(${originals.length} eligible file(s))`
-    );
+    return originals
+        .filter((media) => playableFileIds.has(media.fileId))
+        .map((media) => media._id);
+};
+
+const purgeOriginalBatch = async (limit: number, afterId = ""): Promise<PurgeResult> => {
+    const originals = await findOriginalBatch(limit, afterId);
+    if (originals.length === 0) {
+        return {
+            scanned: 0,
+            candidates: 0,
+            softDeleted: 0,
+            lastScannedId: "",
+        };
+    }
+
+    const originalIds = await findEligibleOriginalIds(originals);
+    let softDeleted = 0;
+
+    if (originalIds.length > 0) {
+        const result = await MediaModel.updateMany(
+            {
+                _id: { $in: originalIds },
+                type: MediaType.VIDEO,
+                resolution: Resolution.ORIGINAL,
+                deletedAt: { $exists: false },
+            },
+            { $set: { deletedAt: new Date() } }
+        );
+        softDeleted = result.modifiedCount;
+
+        console.log(
+            `[cleanup:originals] soft-deleted ${softDeleted} original media ` +
+            `(${originalIds.length} eligible, ${originals.length} scanned)`
+        );
+    }
+
     return {
-        candidates: originals.length,
-        softDeleted: result.modifiedCount,
-        lastId: String(originals[originals.length - 1]._id),
+        scanned: originals.length,
+        candidates: originalIds.length,
+        softDeleted,
+        lastScannedId: String(originals[originals.length - 1]._id),
     };
 };
 
-// Normal cron: delete one bounded batch. Successfully deleted originals leave
-// the active index, so the next run naturally advances without a process marker
-// or persistent cursor.
+// Normal cron: ตรวจเพียงหนึ่ง bounded batch ต่อรอบ และเลื่อน cursor จากรายการ
+// ที่ "ตรวจแล้ว" ไม่ใช่เฉพาะรายการที่ลบได้ จึงไม่ติดอยู่กับ Original กลุ่มเดิม
 export const cleanupOriginalMedia = async () => {
     try {
-        const result = await purgeEligibleOriginals(NORMAL_BATCH);
+        let result = await purgeOriginalBatch(NORMAL_BATCH, normalCursor);
+
+        // เดินถึงท้าย collection แล้ว: วนกลับต้นทันทีในรอบเดียวกัน เพื่อไม่เสีย cron
+        if (result.scanned === 0 && normalCursor) {
+            normalCursor = "";
+            result = await purgeOriginalBatch(NORMAL_BATCH);
+        }
+
+        normalCursor = result.scanned < NORMAL_BATCH ? "" : result.lastScannedId;
+
+        if (result.scanned === 0) {
+            return { message: "No original medias to scan", data: result };
+        }
         if (result.candidates === 0) {
-            return { message: "No eligible original medias" };
+            return { message: "No eligible original medias", data: result };
         }
         return { message: "Success", data: result };
     } catch (error) {
@@ -113,20 +153,19 @@ export const cleanupOriginalMedia = async () => {
     }
 };
 
-// Manual full sweep remains cursor-compatible for callers that want to drain
-// several batches immediately. Normal cron no longer requires this endpoint.
-// GET /cron-job/cleanup-original-media?full=1[&cursor=<lastOriginalId>]
+// Manual full sweep ใช้ cursor จาก caller และคืน cursor จากรายการสุดท้ายที่ตรวจ
+// GET /cron-job/cleanup-original-media?full=1[&cursor=<lastScannedId>]
 export const cleanupOriginalMediaFull = async (cursor: string) => {
     try {
-        const result = await purgeEligibleOriginals(FULL_BATCH, cursor);
+        const result = await purgeOriginalBatch(FULL_BATCH, cursor);
         return {
-            message: result.candidates === 0 ? "Sweep done" : "Success",
+            message: result.scanned === 0 ? "Sweep done" : "Success",
             data: {
-                done: result.candidates < FULL_BATCH,
-                scanned: result.candidates,
+                done: result.scanned < FULL_BATCH,
+                scanned: result.scanned,
                 files: result.candidates,
                 softDeleted: result.softDeleted,
-                nextCursor: result.lastId || cursor,
+                nextCursor: result.lastScannedId || cursor,
             },
         };
     } catch (error) {
