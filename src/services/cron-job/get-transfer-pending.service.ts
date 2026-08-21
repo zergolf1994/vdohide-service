@@ -29,6 +29,10 @@ const default_transfer_config: TransferConfig = {
     balanceGap: 8,
 };
 
+// Local ที่แตะ maxPercent แล้วห้ามเป็นปลายทางถาวร แต่ worker ของเครื่องนั้น
+// ยังทำหน้าที่ relay จาก Temp ไป permanent S3 ได้จนถึง safety guard 98%.
+const LOCAL_RELAY_MAX_PERCENT = 98;
+
 // ─── Storage balance ─────────────────────────────────────────
 // เลือก storage ปลายทางให้ไฟล์: เอาตัวที่ % ต่ำสุด (±gap) แล้วกระจาย
 // tie ด้วย fnv1a(fileId) — deterministic ทุกที่คำนวณได้ตรงกัน
@@ -72,8 +76,9 @@ export const getTransferPending = async () => {
             return { message: "Transfer is disabled" };
         }
 
-        const [storages, permanentS3Storages, workers] = await Promise.all([
+        const [storages, relayStorages, permanentS3Storages, workers] = await Promise.all([
             getLocalStorages(transfer_config.maxPercent),
+            getLocalStorages(LOCAL_RELAY_MAX_PERCENT),
             getPermanentS3Storages(),
             getWorkers({ type: WorkerType.TRANSFER }),
         ]);
@@ -105,14 +110,14 @@ export const getTransferPending = async () => {
             return { message: "Queue is full", data: { slotsByStorage: Object.fromEntries(slotsByStorage) } };
         }
 
-        // executor มีได้สองแบบ:
-        // 1) worker ที่ผูกกับ permanent S3 เดียวกับปลายทาง (ทางตรงและควรเลือกก่อน)
-        // 2) worker ที่ผูกกับ local storage ทำหน้าที่อัปโหลดต่อไป permanent S3
+        // Local ต่ำกว่า maxPercent เป็นปลายทางถาวรได้ ส่วน Local ที่แตะ cutoff
+        // แต่ยังต่ำกว่า safety guard ใช้เป็น relay ไป permanent S3 ได้เท่านั้น
         // targetStorageId คือ executor เสมอ ส่วน destinationStorageId คือปลายทางจริง
-        const localExecutors = (storages.data as any[]).filter((s) => slotsByStorage.has(String(s._id)));
+        const localInstallExecutors = (storages.data as any[]).filter((s) => slotsByStorage.has(String(s._id)));
+        const localRelayExecutors = (relayStorages.data as any[]).filter((s) => slotsByStorage.has(String(s._id)));
         const permanentS3 = permanentS3Storages.data as any[];
         const directS3Executors = permanentS3.filter((s) => slotsByStorage.has(String(s._id)));
-        if (localExecutors.length === 0 && directS3Executors.length === 0) {
+        if (localRelayExecutors.length === 0 && directS3Executors.length === 0) {
             return { message: "No storage with alive transfer worker" };
         }
 
@@ -252,27 +257,44 @@ export const getTransferPending = async () => {
             const availableDirectS3 = directS3Executors.filter(
                 (storage) => (slotsByStorage.get(String(storage._id)) ?? 0) > 0,
             );
-            const availableLocal = localExecutors.filter(
+            const availableLocalInstall = localInstallExecutors.filter(
+                (storage) => (slotsByStorage.get(String(storage._id)) ?? 0) > 0,
+            );
+            const availableLocalRelay = localRelayExecutors.filter(
                 (storage) => (slotsByStorage.get(String(storage._id)) ?? 0) > 0,
             );
 
-            // Permanent S3 ที่มี worker ผูก storageId เดียวกันรับงานโดยตรง
-            // targetStorageId และ destinationStorageId จึงเป็น ID เดียวกัน
-            const forceLocal = localFallbackFiles.has(fileId);
-            const directS3 = forceLocal
-                ? null
-                : pickBalancedStorage(fileId, availableDirectS3, transfer_config.balanceGap);
-            const executor = directS3 ?? pickBalancedStorage(fileId, availableLocal, transfer_config.balanceGap);
+            let executor: string | null = null;
+            let s3Destination: string | null = null;
+
+            if (!migration && localInstallExecutors.length > 0) {
+                // ไฟล์เข้าใหม่: Local-first อย่างเคร่งครัด ถ้า Local ที่รับได้ยังมีอยู่
+                // แต่ slot เต็ม ให้รอรอบถัดไป ไม่ spill ไป B2 ก่อนลำดับ
+                executor = pickBalancedStorage(fileId, availableLocalInstall, transfer_config.balanceGap);
+                if (!executor) continue;
+            } else if (!migration) {
+                // Local ทุกตัวแตะ 95% หรือไม่พร้อม → spill ไป permanent S3/B2
+                // ถ้า B2 ไม่มี worker โดยตรง ให้ Local ที่ยังต่ำกว่า 98% เป็น relay
+                const directS3 = pickBalancedStorage(fileId, availableDirectS3, transfer_config.balanceGap);
+                executor = directS3 ?? pickBalancedStorage(fileId, availableLocalRelay, transfer_config.balanceGap);
+                s3Destination = directS3 ?? pickBalancedStorage(fileId, permanentS3, transfer_config.balanceGap);
+                if (!executor || !s3Destination) continue;
+            } else {
+                // Migration คงนโยบายเดิม: S3 โดยตรงก่อน แล้วค่อย Local
+                const forceLocal = localFallbackFiles.has(fileId) && permanentS3.length === 0;
+                const directS3 = forceLocal
+                    ? null
+                    : pickBalancedStorage(fileId, availableDirectS3, transfer_config.balanceGap);
+                executor = directS3 ?? pickBalancedStorage(fileId, availableLocalInstall, transfer_config.balanceGap);
+                s3Destination = forceLocal
+                    ? null
+                    : directS3 ?? pickBalancedStorage(fileId, permanentS3, transfer_config.balanceGap);
+            }
+
             if (!executor) continue;
             const remain = slotsByStorage.get(executor) ?? 0;
             if (remain <= 0) continue;
             slotsByStorage.set(executor, remain - 1);
-
-            // ถ้าใช้ local executor ให้เลือก permanent S3 เป็นปลายทางถ้ามี;
-            // ถ้าไม่มี permanent S3 จะไม่ใส่ destinationStorageId และติดตั้ง local
-            const s3Destination = forceLocal
-                ? null
-                : directS3 ?? pickBalancedStorage(fileId, permanentS3, transfer_config.balanceGap);
 
             docs.push({
                 fileId: f._id,
