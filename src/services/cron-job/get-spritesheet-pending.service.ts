@@ -7,18 +7,34 @@ import {
     VIDEO_PROCESS_OPEN_STATUSES,
     WorkerType,
 } from "@/core/enums";
-import { FileModel, IngestModel, MediaModel, VideoProcessModel } from "@/db/models";
+import { FileModel, IngestModel, MediaModel, VideoProcessModel, WorkspaceModel } from "@/db/models";
 import { getWorkers } from "../worker/get-workers.service";
 import { getSettingsByNames } from "../setting/get-setting.service";
+import {
+    buildTranscodeFileFilter,
+    DEFAULT_TRANSCODE_FILE_SELECTION,
+    normalizeTranscodeFileSelection,
+    TranscodeFileSelection,
+} from "./transcode-file-filter";
+import {
+    buildTranscodeWorkspaceFilter,
+    DEFAULT_TRANSCODE_WORKSPACE_SELECTION,
+    normalizeTranscodeWorkspaceSelection,
+    TranscodeWorkspaceSelection,
+} from "./transcode-workspace-filter";
 
 interface SpritesheetConfig {
     enabled: boolean;
     slotRate: number;
+    workspaceSelection?: TranscodeWorkspaceSelection;
+    fileSelection?: TranscodeFileSelection;
 }
 
 const default_spritesheet_config: SpritesheetConfig = {
     enabled: true,
     slotRate: 2,
+    workspaceSelection: DEFAULT_TRANSCODE_WORKSPACE_SELECTION,
+    fileSelection: DEFAULT_TRANSCODE_FILE_SELECTION,
 };
 
 // enqueuer: ไฟล์ ready ที่มี video media แต่ยังไม่มี thumbnail → เติมงาน spritesheet
@@ -37,6 +53,23 @@ export const getSpritesheetPending = async () => {
 
         if (!spritesheet_config.enabled) {
             return { message: "Spritesheet is disabled" };
+        }
+
+        const workspaceSelection = normalizeTranscodeWorkspaceSelection(
+            spritesheet_config.workspaceSelection
+        );
+        const fileSelection = normalizeTranscodeFileSelection(
+            spritesheet_config.fileSelection
+        );
+        let eligibleWorkspaceIds: string[] | null = null;
+        if (workspaceSelection.rules.length > 0) {
+            eligibleWorkspaceIds = await WorkspaceModel.distinct(
+                "_id",
+                buildTranscodeWorkspaceFilter(workspaceSelection)
+            );
+            if (eligibleWorkspaceIds.length === 0) {
+                return { message: "No workspaces eligible for spritesheet" };
+            }
         }
 
         const workers = await getWorkers({ type: WorkerType.SPRITESHEET });
@@ -131,15 +164,37 @@ export const getSpritesheetPending = async () => {
             return { message: "No files to enqueue", data: { totalSlots } };
         }
 
-        const files = await FileModel.find({
+        const baseFileFilter: Record<string, unknown> = {
             _id: { $in: [...storageByFile.keys()] },
             type: FileType.VIDEO,
             status: { $in: [FileStatus.READY_ORIGINAL, FileStatus.READY] },
             clonedFrom: { $exists: false },
             "metadata.trashedAt": { $exists: false },
             "metadata.deletedAt": { $exists: false },
-        })
-            .sort({ createdAt: 1 })
+        };
+        const fileFilters: Record<string, unknown>[] = [baseFileFilter];
+        if (eligibleWorkspaceIds) {
+            fileFilters.push({ spaceId: { $in: eligibleWorkspaceIds } });
+        }
+        const configuredFileFilter = buildTranscodeFileFilter(fileSelection);
+        if (Object.keys(configuredFileFilter).length > 0) {
+            fileFilters.push(configuredFileFilter);
+        }
+        const fileFilter = fileFilters.length === 1
+            ? baseFileFilter
+            : { $and: fileFilters };
+        const fileSort = Object.fromEntries([
+            ...(fileSelection.sort.length > 0
+                ? fileSelection.sort.map((entry) => [
+                    entry.field === "size" ? "metadata.size" : "createdAt",
+                    entry.direction === "asc" ? 1 : -1,
+                ])
+                : [["createdAt", 1]]),
+            ["_id", 1],
+        ]);
+
+        const files = await FileModel.find(fileFilter)
+            .sort(fileSort)
             .limit(totalSlots * 3) // เผื่อบางไฟล์อยู่ storage ที่ slot หมด
             .select({ _id: 1, spaceId: 1, slug: 1 })
             .lean();
