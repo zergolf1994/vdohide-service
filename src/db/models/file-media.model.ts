@@ -21,6 +21,7 @@ const mediaMetadataSchema = new Schema(
         sampleRate: { type: Number },
         bitrate: { type: Number },
         mediaLayout: { type: String, enum: ["muxed", "separated"] },
+        clonePolicy: { type: String, enum: ["shared", "isolated"] },
     },
     {
         _id: false

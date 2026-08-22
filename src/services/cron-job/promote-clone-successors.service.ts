@@ -1,6 +1,8 @@
 import { FileType, MediaType } from "@/core/enums";
 import { FileModel, MediaModel } from "@/db/models";
 
+const ISOLATED_CLONE_POLICY = "isolated" as const;
+
 const activeCloneFilter = {
     type: FileType.VIDEO,
     "metadata.trashedAt": { $exists: false },
@@ -109,9 +111,64 @@ export const promoteCloneSuccessors = async (
 const auxiliaryMediaFilter = {
     $or: [
         { type: MediaType.AUDIO },
-        { type: MediaType.SUBTITLE },
+        {
+            type: MediaType.SUBTITLE,
+            "metadata.clonePolicy": { $ne: ISOLATED_CLONE_POLICY },
+        },
         { type: MediaType.THUMBNAIL, fileName: "sprite.vtt" },
     ],
+};
+
+// Older user-uploaded subtitle records predate clonePolicy. Their browser-side
+// content hash is a reliable marker, while generated tracks do not use it.
+// Mark the upload itself isolated, then retire only propagated copies. The
+// physical object stays referenced by the original Media record.
+const retireLegacyIsolatedSubtitleCopies = async () => {
+    const unclassified = await MediaModel.find({
+        type: MediaType.SUBTITLE,
+        sourceHash: /^fnv1a_[0-9a-f]{8}$/i,
+        "metadata.clonePolicy": { $exists: false },
+        deletedAt: { $exists: false },
+    })
+        .sort({ _id: 1 })
+        .limit(500)
+        .select({ _id: 1 })
+        .lean();
+
+    let classified = 0;
+    if (unclassified.length > 0) {
+        const result = await MediaModel.updateMany(
+            { _id: { $in: unclassified.map((media) => media._id) } },
+            { $set: { "metadata.clonePolicy": ISOLATED_CLONE_POLICY, updatedAt: new Date() } },
+        );
+        classified = result.modifiedCount;
+    }
+
+    const propagated = await MediaModel.find({
+        type: MediaType.SUBTITLE,
+        "metadata.clonePolicy": ISOLATED_CLONE_POLICY,
+        clonedFrom: { $exists: true, $nin: [null, ""] },
+        deletedAt: { $exists: false },
+    })
+        .sort({ _id: 1 })
+        .limit(500)
+        .select({ _id: 1 })
+        .lean();
+
+    let retired = 0;
+    if (propagated.length > 0) {
+        const now = new Date();
+        const result = await MediaModel.updateMany(
+            { _id: { $in: propagated.map((media) => media._id) }, deletedAt: { $exists: false } },
+            { $set: { deletedAt: now, updatedAt: now } },
+        );
+        retired = result.modifiedCount;
+    }
+
+    if (classified > 0 || retired > 0) {
+        console.log(`[repair:clone-media] classified ${classified} isolated subtitle(s), retired ${retired} propagated copy/copies`);
+    }
+    return { classified, retired };
 };
 
 const mediaIdentity = (media: any) => {
@@ -154,7 +211,6 @@ const syncMissingCloneAuxiliaryMedia = async () => {
             "metadata.highest": 1,
             "metadata.mediaLayout": 1,
             "metadata.audioTrackCount": 1,
-            "metadata.subtitleTrackCount": 1,
         })
         .lean();
     const existingSourceIds = new Set((existingSources as any[]).map((file) => String(file._id)));
@@ -207,8 +263,6 @@ const syncMissingCloneAuxiliaryMedia = async () => {
         if (sourceMetadata) {
             const audioCount = [...desiredByIdentity.values()]
                 .filter((media) => media.type === MediaType.AUDIO).length;
-            const subtitleCount = [...desiredByIdentity.values()]
-                .filter((media) => media.type === MediaType.SUBTITLE).length;
             const metadataSet: Record<string, unknown> = {};
 
             if (sourceMetadata.highest !== undefined) {
@@ -220,10 +274,6 @@ const syncMissingCloneAuxiliaryMedia = async () => {
             if (sourceMetadata.audioTrackCount !== undefined || audioCount > 0) {
                 metadataSet["metadata.audioTrackCount"] = sourceMetadata.audioTrackCount ?? audioCount;
             }
-            if (sourceMetadata.subtitleTrackCount !== undefined || subtitleCount > 0) {
-                metadataSet["metadata.subtitleTrackCount"] = sourceMetadata.subtitleTrackCount ?? subtitleCount;
-            }
-
             const metadataEntries = Object.entries(metadataSet);
             if (metadataEntries.length > 0) {
                 fileOperations.push({
@@ -304,6 +354,36 @@ const syncMissingCloneAuxiliaryMedia = async () => {
         syncedMedia = mediaResult.upsertedCount;
     }
 
+    // Counts are per File because isolated user uploads intentionally differ
+    // across clone members. Recompute after shared-media upserts and legacy
+    // copy retirement instead of copying the canonical File's count.
+    const subtitleCounts = await MediaModel.aggregate<{ _id: string; count: number }>([
+        {
+            $match: {
+                fileId: { $in: groupFileIds },
+                type: MediaType.SUBTITLE,
+                deletedAt: { $exists: false },
+            },
+        },
+        { $group: { _id: "$fileId", count: { $sum: 1 } } },
+    ]);
+    const subtitleCountByFile = new Map(
+        subtitleCounts.map((entry) => [String(entry._id), entry.count]),
+    );
+    const countOperations = groupFileIds.map((fileId) => {
+        const count = subtitleCountByFile.get(fileId) ?? 0;
+        return {
+            updateOne: {
+                filter: { _id: fileId, "metadata.subtitleTrackCount": { $ne: count } },
+                update: { $set: { "metadata.subtitleTrackCount": count, updatedAt: new Date() } },
+            },
+        };
+    });
+    if (countOperations.length > 0) {
+        const countResult = await FileModel.bulkWrite(countOperations, { ordered: false });
+        syncedFiles += countResult.modifiedCount;
+    }
+
     if (syncedFiles > 0 || syncedMedia > 0) {
         console.log(`[repair:clone-media] synced ${syncedFiles} file metadata and ${syncedMedia} missing audio/subtitle/sprite media record(s)`);
     }
@@ -312,6 +392,7 @@ const syncMissingCloneAuxiliaryMedia = async () => {
 
 // Repairs legacy groups where the source File document was already removed.
 export const repairOrphanedCloneGroups = async () => {
+    const isolated = await retireLegacyIsolatedSubtitleCopies();
     const roots = await FileModel.distinct("clonedFrom", {
         ...activeCloneFilter,
         clonedFrom: { $exists: true, $nin: [null, ""] },
@@ -333,9 +414,9 @@ export const repairOrphanedCloneGroups = async () => {
     const { syncedFiles, syncedMedia } = await syncMissingCloneAuxiliaryMedia();
 
     return {
-        message: promoted > 0 || syncedFiles > 0 || syncedMedia > 0
+        message: promoted > 0 || syncedFiles > 0 || syncedMedia > 0 || isolated.classified > 0 || isolated.retired > 0
             ? "Success"
             : "No clone repairs needed",
-        data: { scanned: orphaned.length, promoted, syncedFiles, syncedMedia },
+        data: { scanned: orphaned.length, promoted, syncedFiles, syncedMedia, ...isolated },
     };
 };
