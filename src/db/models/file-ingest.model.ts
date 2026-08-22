@@ -67,6 +67,9 @@ const ingestSchema = new Schema(
 ingestSchema.index({ fileId: 1, status: 1 });
 ingestSchema.index({ status: 1, updatedAt: 1 });
 ingestSchema.index({ deletedAt: 1 });
+// repair-completed-ingests: scan only active completed upload/processed docs
+// older than the safety grace period without walking the entire collection.
+ingestSchema.index({ sourceType: 1, status: 1, deletedAt: 1, updatedAt: 1 });
 ingestSchema.index(
     { migrationId: 1, sourceMediaId: 1 },
     {

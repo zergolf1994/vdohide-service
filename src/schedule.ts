@@ -16,6 +16,7 @@ import { getStorageDrainPending } from "@/services/cron-job/get-storage-drain-pe
 import { cleanupDeletedWorkspaces } from "@/services/cron-job/cleanup-deleted-workspaces.service"
 import { verifyCustomDomains } from "@/services/cron-job/verify-custom-domains.service"
 import { repairOrphanedCloneGroups } from "@/services/cron-job/promote-clone-successors.service"
+import { repairCompletedIngests } from "@/services/cron-job/repair-completed-ingests.service"
 
 // enqueuer หนึ่งตัวต่อหนึ่ง cron — กันรอบใหม่ทับรอบเก่า + log เฉพาะตอนสถานะเปลี่ยน
 const runEnqueuer = (name: string, fn: () => Promise<{ message?: string; data?: any } | undefined>) => {
@@ -59,8 +60,10 @@ schedule.scheduleJob("50 * * * * *", runEnqueuer("enqueuer:prewarm", getPrewarmP
 // reaper: worker ตายคางาน (heartbeat ขาดเกิน 3 นาที) → คืนงานเข้าคิว
 schedule.scheduleJob("5 * * * * *", runEnqueuer("reaper", releaseStaleJobs));
 
+// ingest repair ทุก 1 นาที: ซ่อม ingest ที่ worker จบแล้วแต่ MongoDB update หลุด
 // ingest cleanup ทุก 1 นาที: ลบ object บน S3 ของ ingest ที่ soft-delete แล้ว
 // file cleanup ทุก 5 นาที: ลบ doc ที่ไม่เหลือ ingest/media อ้างอิง
+schedule.scheduleJob("25 * * * * *", runEnqueuer("repair:ingests", repairCompletedIngests));
 schedule.scheduleJob("35 * * * * *", runEnqueuer("cleanup:ingests", cleanupDeletedIngests));
 schedule.scheduleJob("30 */2 * * * *", runEnqueuer("cleanup:files", cleanupDeletedFiles));
 
